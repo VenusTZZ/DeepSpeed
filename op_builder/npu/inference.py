@@ -34,11 +34,11 @@ class InferenceContext:
 
     workSpaceSize = 0
     kv_caches = None
-    # RoPE sin/cos table cache: (rotary_dim, rope_theta, dtype) -> (max_len, sin, cos)
+    # RoPE sin/cos table cache: (rotary_dim, rope_theta, dtype, device) -> (max_len, sin, cos)
     _rope_tables = {}
 
     @staticmethod
-    def rope_table(rotary_dim, rope_theta, dtype, need_len):
+    def rope_table(rotary_dim, rope_theta, dtype, need_len, device):
         """Precompute the sin/cos rotation table and grow it by 2x on demand.
 
         The previous implementation recomputed the whole chain (H2D + pow/outer/sin/cos) on
@@ -46,13 +46,13 @@ class InferenceContext:
         table (measured ~0.65ms); the table is built in fp32 to avoid the slow float64 chain
         on NPU.
         """
-        key = (rotary_dim, rope_theta, dtype)
+        key = (rotary_dim, rope_theta, dtype, device)
         entry = InferenceContext._rope_tables.get(key)
         if entry is None or entry[0] < need_len:
             max_len = need_len if entry is None else max(need_len, entry[0] * 2)
-            seq_id = torch.arange(0, max_len, dtype=torch.float32).to("npu")
+            seq_id = torch.arange(0, max_len, dtype=torch.float32).to(device)
             inv_freq = torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim
-            inv_freq = inv_freq.to("npu")
+            inv_freq = inv_freq.to(device)
             inv_freq = 1.0 / torch.pow(rope_theta, inv_freq)
             freqs = torch.outer(seq_id, inv_freq)
             sin = freqs.sin().view(-1, max_len, 1, rotary_dim // 2).repeat_interleave(2, dim=-1)
@@ -87,14 +87,22 @@ class InferenceContext:
         a geometric capacity schedule; the entry is [k_buf, v_buf, kv_len].
         """
         entry = InferenceContext.kv_caches[layer_id]
-        if entry is None or entry[0] is None or entry[0].shape[1] < need_len:
-            cap = need_len if entry is None or entry[0] is None else max(need_len, entry[0].shape[1] * 2)
+        old = entry[0] if entry is not None else None
+        # Reallocate on any shape/dtype/device change, not just on length: a dtype
+        # mismatch would otherwise silently cast the written rows, and a batch or
+        # kv_dim change would fail far from this reuse decision
+        if old is None or old.shape[0] != bsz or old.shape[1] < need_len or old.shape[2] != kv_dim \
+                or old.dtype != dtype or old.device != device:
+            cap = need_len if old is None else max(need_len, old.shape[1] * 2)
             k_buf = torch.empty((bsz, cap, kv_dim), dtype=dtype, device=device)
             v_buf = torch.empty((bsz, cap, kv_dim), dtype=dtype, device=device)
             kv_len = 0
-            if entry is not None and entry[0] is not None:
+            # Move the old rows over only when the shapes still line up; a batch or
+            # kv_dim change means a different request, whose cache cannot be carried
+            # over (a dtype change casts on write, a device change copies across)
+            if old is not None and old.shape[0] == bsz and old.shape[2] == kv_dim:
                 kv_len = entry[2]
-                k_buf[:, :kv_len] = entry[0][:, :kv_len]
+                k_buf[:, :kv_len] = old[:, :kv_len]
                 v_buf[:, :kv_len] = entry[1][:, :kv_len]
             InferenceContext.kv_caches[layer_id] = [k_buf, v_buf, kv_len]
         return InferenceContext.kv_caches[layer_id]
@@ -143,7 +151,8 @@ class NPUInference:
             # The number of rows needed is seq_offset + seq_length: prompt (offset=0) needs
             # seq_length, decode (len=1) needs offset+1, and a future chunked prefill
             # (both > 0) is covered as well
-            sin, cos = InferenceContext.rope_table(rotary_dim, rope_theta, q.dtype, seq_offset + seq_length)
+            sin, cos = InferenceContext.rope_table(rotary_dim, rope_theta, q.dtype, seq_offset + seq_length,
+                                                   vals.device)
             # shape: [bsz=1, seq_len, heads=1, rotary_dim]
             sin = sin[:, seq_offset:seq_offset + seq_length]
             cos = cos[:, seq_offset:seq_offset + seq_length]
@@ -190,9 +199,12 @@ class NPUInference:
         k = k // (heads + 2 * (num_kv if num_kv > 0 else heads))
         hidden_dim = heads * k
 
+        # The is_prompt/token_idx/position_ids parameters exist only for signature
+        # alignment with the v2 interface and are ignored: seq_len decides the path,
+        # which matches every current caller (first_token implies seq_len > 1)
         is_promt = seq_len > 1
         if not InferenceContext.kv_caches:
-            InferenceContext.kv_caches = [[None, None] for _ in range(num_layers)]
+            InferenceContext.kv_caches = [[None, None, 0] for _ in range(num_layers)]
         if is_promt:
             InferenceContext.reset_tokens(seq_len)
             # Keep the previous buffer when it fits, so fixed-length workloads (e.g.
@@ -206,9 +218,9 @@ class NPUInference:
         workspace = InferenceContext.GetWorkSpace()
         if is_promt:
             seq_offset = 0
-            # Leave headroom so the first decode step does not trigger a grow-copy of
-            # the whole prompt cache
-            need_len = 2 * seq_len
+            # Leave headroom so the first decode step does not trigger a grow-copy of the
+            # whole prompt cache, capped so long prompts do not double their peak memory
+            need_len = min(2 * seq_len, seq_len + 2048)
         else:
             # The new decode token's 0-based position is the number of cached tokens,
             # which kv_len tracks per layer (advance_tokens keeps soft_len-1 in sync)
