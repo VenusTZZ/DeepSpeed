@@ -47,6 +47,28 @@ class InferenceContext:
     def GetWorkSpace():
         return InferenceContext._workspace
 
+    @staticmethod
+    def ensure_kv_buffer(layer_id, need_len, bsz, kv_dim, dtype, device):
+        """Grow-on-demand KV buffer stored in the layout npu_fusion_attention consumes.
+
+        The buffer keeps K/V as [bsz, cap, num_kv_heads * head_dim]: a decode step writes
+        one row at kv_len and attention reads the [:, :kv_len] view, both O(1) instead of
+        a full-cache copy. Doubling on overflow amortizes the grow copies the same way as
+        a geometric capacity schedule; the entry is [k_buf, v_buf, kv_len].
+        """
+        entry = InferenceContext.kv_caches[layer_id]
+        if entry is None or entry[0] is None or entry[0].shape[1] < need_len:
+            cap = need_len if entry is None or entry[0] is None else max(need_len, entry[0].shape[1] * 2)
+            k_buf = torch.empty((bsz, cap, kv_dim), dtype=dtype, device=device)
+            v_buf = torch.empty((bsz, cap, kv_dim), dtype=dtype, device=device)
+            kv_len = 0
+            if entry is not None and entry[0] is not None:
+                kv_len = entry[2]
+                k_buf[:, :kv_len] = entry[0][:, :kv_len]
+                v_buf[:, :kv_len] = entry[1][:, :kv_len]
+            InferenceContext.kv_caches[layer_id] = [k_buf, v_buf, kv_len]
+        return InferenceContext.kv_caches[layer_id]
+
 
 class NPUInference:
 
@@ -86,7 +108,9 @@ class NPUInference:
 
         if rotary_dim > 0 and rotate_every_two:
             # sin, cos may use cache
-            seq_id = torch.arange(0, seq_length).to("npu")
+            # seq_offset shifts every position to its absolute position in the sequence;
+            # decode tokens previously always used position 0 rotation angles
+            seq_id = torch.arange(0, seq_length, device=vals.device) + seq_offset
             inv_freq = torch.arange(0, rotary_dim, 2) / rotary_dim
             inv_freq = inv_freq.to("npu")
             inv_freq = 1.0 / torch.pow(rope_theta, inv_freq)
@@ -100,14 +124,19 @@ class NPUInference:
             q_pos, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
             k_pos, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-            q_pos = torch_npu.npu_rotary_mul(q_pos, cos, sin)
+            # sin/cos are in the interleaved layout (repeat_interleave(2)), so the
+            # interleave mode is required to match rotate_every_two semantics; the
+            # default half mode pairs first/second halves and rotates incorrectly
+            q_pos = torch_npu.npu_rotary_mul(q_pos, cos, sin, 'interleave')
             q = torch.cat([q_pos, q_pass], dim=-1)
-            k_pos = torch_npu.npu_rotary_mul(k_pos, cos, sin)
+            k_pos = torch_npu.npu_rotary_mul(k_pos, cos, sin, 'interleave')
             k = torch.cat([k_pos, k_pass], dim=-1)
 
         output = q.reshape(bsz, seq_length, -1).contiguous()  # [b, s, H]
-        k_cache = k.reshape(bsz, seq_length, heads, -1).transpose(1, 2).contiguous()  # [b, n, s, d]
-        v_cache = v.reshape(bsz, seq_length, heads, -1).transpose(1, 2).contiguous()  # [b, n, s, d]
+        # K and V carry num_kv groups (not heads), which differs in GQA; reshaping with
+        # heads silently reshuffles head dims when the element counts happen to divide
+        k_cache = k.reshape(bsz, seq_length, num_kv, -1).transpose(1, 2).contiguous()  # [b, n, s, d]
+        v_cache = v.reshape(bsz, seq_length, num_kv, -1).transpose(1, 2).contiguous()  # [b, n, s, d]
         return output, k_cache, v_cache
 
     @staticmethod
@@ -123,11 +152,27 @@ class NPUInference:
             InferenceContext.kv_caches = [[None, None] for _ in range(num_layers)]
         if is_promt:
             InferenceContext.reset_tokens(seq_len)
-            InferenceContext.kv_caches[layer_id] = [None, None]
+            # Keep the previous buffer when it fits, so fixed-length workloads (e.g.
+            # diffusers runs prompt-length forward passes every step) do not reallocate.
+            entry = InferenceContext.kv_caches[layer_id]
+            if entry is not None and entry[0] is not None and entry[0].shape[1] >= seq_len:
+                entry[2] = 0
+            else:
+                InferenceContext.kv_caches[layer_id] = [None, None]
 
-        soft_len = InferenceContext.current_tokens()
         workspace = InferenceContext.GetWorkSpace()
-        seq_offset = 0 if is_promt else soft_len - 1
+        if is_promt:
+            seq_offset = 0
+            # Leave headroom so the first decode step does not trigger a grow-copy of
+            # the whole prompt cache
+            need_len = 2 * seq_len
+        else:
+            # The new decode token's 0-based position is the number of cached tokens;
+            # kv_len tracks that per layer since soft_len stays at the prompt length
+            prev = InferenceContext.kv_caches[layer_id]
+            cached_len = 0 if prev is None or prev[0] is None else prev[2]
+            seq_offset = cached_len
+            need_len = cached_len + 1
 
         q, k, v = NPUInference._bias_add_transform_0213(vals=query_key_value,
                                                         bias=None,
@@ -141,20 +186,32 @@ class NPUInference:
                                                         rotate_every_two=rotate_every_two,
                                                         rope_theta=rope_theta)
 
-        if not is_promt:
-            k_cache, v_cache = InferenceContext.kv_caches[layer_id]
-            if k_cache is not None:
-                k = torch.cat([k_cache, k], dim=2)
-                v = torch.cat([v_cache, v], dim=2)
-        InferenceContext.kv_caches[layer_id] = [k, v]
-        seq_len = k.shape[2]
+        # Write K/V into a preallocated buffer instead of torch.cat: a decode step used
+        # to reallocate and copy the whole cache (O(n) per token, O(n^2) per sequence),
+        # plus a second full copy for the contiguous BSH layout. The buffer is stored in
+        # the [bsz, len, num_kv_heads * head_dim] layout npu_fusion_attention consumes, so
+        # the decode write is a single-row copy and the attention read is a zero-copy view.
+        kv_dim = k.shape[1] * k.shape[3]
+        k_buf, v_buf, kv_len = InferenceContext.ensure_kv_buffer(layer_id, need_len, bsz, kv_dim, q.dtype, q.device)
+
+        if is_promt:
+            k_buf[:, :seq_len] = k.transpose(1, 2).reshape(bsz, seq_len, -1)
+            v_buf[:, :seq_len] = v.transpose(1, 2).reshape(bsz, seq_len, -1)
+            kv_len = seq_len
+        else:
+            # kv_len advances on its own so decode write positions never depend on
+            # soft_len, which stays at the prompt length on this code path
+            k_buf[:, kv_len:kv_len + 1] = k.reshape(bsz, 1, -1)
+            v_buf[:, kv_len:kv_len + 1] = v.reshape(bsz, 1, -1)
+            kv_len += 1
+        InferenceContext.kv_caches[layer_id] = [k_buf, v_buf, kv_len]
 
         layer_scale = max(1, layer_id) if len(alibi.size()) > 1 else 1.0
         alpha = norm_factor * norm_factor / layer_scale
 
         output = torch_npu.npu_fusion_attention(q,
-                                                k.transpose(1, 2).reshape(bsz, seq_len, -1).contiguous(),
-                                                v.transpose(1, 2).reshape(bsz, seq_len, -1).contiguous(),
+                                                k_buf[:, :kv_len],
+                                                v_buf[:, :kv_len],
                                                 heads,
                                                 "BSH",
                                                 pse=None,
@@ -166,7 +223,12 @@ class NPUInference:
                                                 keep_prob=1,
                                                 inner_precise=0)[0]
 
-        return output, k, v
+        # Return the cache in the caller's [bsz, heads, len, head_dim] layout as a view
+        # into the buffer (same semantics as the CUDA workspace tensors): no per-token
+        # copy is paid, and the contents advance as later tokens are written
+        k_out = k_buf[:, :kv_len].reshape(bsz, kv_len, -1, k.shape[3]).transpose(1, 2)
+        v_out = v_buf[:, :kv_len].reshape(bsz, kv_len, -1, v.shape[3]).transpose(1, 2)
+        return output, k_out, v_out
 
     @staticmethod
     def softmax_context_fp16(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two, heads, num_kv,
