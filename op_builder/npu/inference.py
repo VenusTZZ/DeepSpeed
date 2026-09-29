@@ -34,10 +34,40 @@ class InferenceContext:
 
     workSpaceSize = 0
     kv_caches = None
+    # RoPE sin/cos table cache: (rotary_dim, rope_theta, dtype) -> (max_len, sin, cos)
+    _rope_tables = {}
+
+    @staticmethod
+    def rope_table(rotary_dim, rope_theta, dtype, need_len):
+        """Precompute the sin/cos rotation table and grow it by 2x on demand.
+
+        The previous implementation recomputed the whole chain (H2D + pow/outer/sin/cos) on
+        every forward, paying the same fixed cost for a single decode token as for the whole
+        table (measured ~0.65ms); the table is built in fp32 to avoid the slow float64 chain
+        on NPU.
+        """
+        key = (rotary_dim, rope_theta, dtype)
+        entry = InferenceContext._rope_tables.get(key)
+        if entry is None or entry[0] < need_len:
+            max_len = need_len if entry is None else max(need_len, entry[0] * 2)
+            seq_id = torch.arange(0, max_len, dtype=torch.float32).to("npu")
+            inv_freq = torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim
+            inv_freq = inv_freq.to("npu")
+            inv_freq = 1.0 / torch.pow(rope_theta, inv_freq)
+            freqs = torch.outer(seq_id, inv_freq)
+            sin = freqs.sin().view(-1, max_len, 1, rotary_dim // 2).repeat_interleave(2, dim=-1)
+            cos = freqs.cos().view(-1, max_len, 1, rotary_dim // 2).repeat_interleave(2, dim=-1)
+            entry = (max_len, sin.to(dtype), cos.to(dtype))
+            InferenceContext._rope_tables[key] = entry
+        return entry[1], entry[2]
 
     @staticmethod
     def reset_tokens(initial_tokens=1):
         InferenceContext._num_tokens = initial_tokens
+
+    @staticmethod
+    def advance_tokens():
+        InferenceContext._num_tokens += 1
 
     @staticmethod
     def current_tokens():
@@ -85,24 +115,26 @@ class NPUInference:
         v = vals[..., hidden_dim + num_kv * (hidden_dim // heads):]
 
         if rotary_dim > 0 and rotate_every_two:
-            # sin, cos may use cache
-            seq_id = torch.arange(0, seq_length).to("npu")
-            inv_freq = torch.arange(0, rotary_dim, 2) / rotary_dim
-            inv_freq = inv_freq.to("npu")
-            inv_freq = 1.0 / torch.pow(rope_theta, inv_freq)
-            inv_freq = torch.outer(seq_id, inv_freq)
-            sin = inv_freq.sin()
-            cos = inv_freq.cos()
+            # sin, cos come from the precomputed cache; a single decode token is indexed by
+            # its absolute position seq_offset (previously seq_offset was ignored and every
+            # decode token used the position-0 rotation angles).
+            # The number of rows needed is seq_offset + seq_length: prompt (offset=0) needs
+            # seq_length, decode (len=1) needs offset+1, and a future chunked prefill
+            # (both > 0) is covered as well
+            sin, cos = InferenceContext.rope_table(rotary_dim, rope_theta, q.dtype, seq_offset + seq_length)
             # shape: [bsz=1, seq_len, heads=1, rotary_dim]
-            sin = sin.view(-1, seq_length, 1, rotary_dim // 2).repeat_interleave(2, dim=-1)
-            cos = cos.view(-1, seq_length, 1, rotary_dim // 2).repeat_interleave(2, dim=-1)
+            sin = sin[:, seq_offset:seq_offset + seq_length]
+            cos = cos[:, seq_offset:seq_offset + seq_length]
 
             q_pos, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
             k_pos, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-            q_pos = torch_npu.npu_rotary_mul(q_pos, cos, sin)
+            # sin/cos are in interleaved layout (repeat_interleave(2)), so the interleave
+            # mode is required to match the rotate_every_two semantics; the default half
+            # mode rotates first/second-half pairs, which is semantically wrong here
+            q_pos = torch_npu.npu_rotary_mul(q_pos, cos, sin, 'interleave')
             q = torch.cat([q_pos, q_pass], dim=-1)
-            k_pos = torch_npu.npu_rotary_mul(k_pos, cos, sin)
+            k_pos = torch_npu.npu_rotary_mul(k_pos, cos, sin, 'interleave')
             k = torch.cat([k_pos, k_pass], dim=-1)
 
         output = q.reshape(bsz, seq_length, -1).contiguous()  # [b, s, H]
@@ -111,9 +143,25 @@ class NPUInference:
         return output, k_cache, v_cache
 
     @staticmethod
-    def _softmax_context(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two, heads, num_kv,
-                         norm_factor, triangular_masking, local_attention, window_size, no_masking, layer_id,
-                         num_layers, alibi, rope_theta):
+    def _softmax_context(query_key_value,
+                         attn_mask,
+                         rotary_dim,
+                         rotate_half,
+                         rotate_every_two,
+                         heads,
+                         num_kv,
+                         norm_factor,
+                         triangular_masking,
+                         local_attention,
+                         window_size,
+                         no_masking,
+                         layer_id,
+                         num_layers,
+                         alibi,
+                         rope_theta,
+                         is_prompt=None,
+                         token_idx=None,
+                         position_ids=None):
         bsz, seq_len, k = query_key_value.size()
         k = k // (heads + 2 * (num_kv if num_kv > 0 else heads))
         hidden_dim = heads * k
@@ -166,31 +214,89 @@ class NPUInference:
                                                 keep_prob=1,
                                                 inner_precise=0)[0]
 
+        # Align with the CUDA csrc (pt_binding.cpp:548): increment the token count after the
+        # last layer's forward, so the next decode token's seq_offset (soft_len-1) lands on
+        # the next absolute position; without this, soft_len stays at the prompt length
+        # during decode and all tokens share the same rotation angles
+        if layer_id == num_layers - 1:
+            InferenceContext.advance_tokens()
+
         return output, k, v
 
     @staticmethod
-    def softmax_context_fp16(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two, heads, num_kv,
-                             norm_factor, triangular_masking, local_attention, window_size, no_masking, layer_id,
-                             num_layers, alibi, rope_theta):
+    def softmax_context_fp16(query_key_value,
+                             attn_mask,
+                             rotary_dim,
+                             rotate_half,
+                             rotate_every_two,
+                             heads,
+                             num_kv,
+                             norm_factor,
+                             triangular_masking,
+                             local_attention,
+                             window_size,
+                             no_masking,
+                             layer_id,
+                             num_layers,
+                             alibi,
+                             rope_theta,
+                             is_prompt=None,
+                             token_idx=None,
+                             position_ids=None):
         return NPUInference._softmax_context(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two,
                                              heads, num_kv, norm_factor, triangular_masking, local_attention,
-                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta)
+                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta,
+                                             is_prompt, token_idx, position_ids)
 
     @staticmethod
-    def softmax_context_bf16(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two, heads, num_kv,
-                             norm_factor, triangular_masking, local_attention, window_size, no_masking, layer_id,
-                             num_layers, alibi, rope_theta):
+    def softmax_context_bf16(query_key_value,
+                             attn_mask,
+                             rotary_dim,
+                             rotate_half,
+                             rotate_every_two,
+                             heads,
+                             num_kv,
+                             norm_factor,
+                             triangular_masking,
+                             local_attention,
+                             window_size,
+                             no_masking,
+                             layer_id,
+                             num_layers,
+                             alibi,
+                             rope_theta,
+                             is_prompt=None,
+                             token_idx=None,
+                             position_ids=None):
         return NPUInference._softmax_context(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two,
                                              heads, num_kv, norm_factor, triangular_masking, local_attention,
-                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta)
+                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta,
+                                             is_prompt, token_idx, position_ids)
 
     @staticmethod
-    def softmax_context_fp32(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two, heads, num_kv,
-                             norm_factor, triangular_masking, local_attention, window_size, no_masking, layer_id,
-                             num_layers, alibi, rope_theta):
+    def softmax_context_fp32(query_key_value,
+                             attn_mask,
+                             rotary_dim,
+                             rotate_half,
+                             rotate_every_two,
+                             heads,
+                             num_kv,
+                             norm_factor,
+                             triangular_masking,
+                             local_attention,
+                             window_size,
+                             no_masking,
+                             layer_id,
+                             num_layers,
+                             alibi,
+                             rope_theta,
+                             is_prompt=None,
+                             token_idx=None,
+                             position_ids=None):
         return NPUInference._softmax_context(query_key_value, attn_mask, rotary_dim, rotate_half, rotate_every_two,
                                              heads, num_kv, norm_factor, triangular_masking, local_attention,
-                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta)
+                                             window_size, no_masking, layer_id, num_layers, alibi, rope_theta,
+                                             is_prompt, token_idx, position_ids)
 
     @staticmethod
     def _vector_matmul(input, weight, async_op, q_scale, q_int8, transposed_mode):
