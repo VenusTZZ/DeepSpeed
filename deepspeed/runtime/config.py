@@ -372,6 +372,59 @@ def get_hybrid_engine_config(param_dict):
     return hybrid_engine_config
 
 
+HIFLOAT8 = "hifloat8"
+HIFLOAT8_DEFAULT = {
+    "enabled": False,
+    "backend": "torchao_npu",
+    "module_name_patterns": (),
+    "min_numel": 0,
+    "expected_module_count": None,
+    "config": None,
+}
+
+
+def get_hifloat8_config(param_dict):
+    """Parse the ``hifloat8`` low-precision training block.
+
+    This validates the block structure only. The ``backend`` value is a
+    contract between the JSON and the accelerators: which backends exist and
+    whether the current platform can run them is checked at engine setup
+    through ``get_accelerator()`` hooks, so no backend name is hardcoded here.
+    """
+    config = param_dict.get(HIFLOAT8, {})
+    if not isinstance(config, dict):
+        raise DeepSpeedConfigError(f"'{HIFLOAT8}' must be an object, got {type(config).__name__}")
+
+    unknown = sorted(set(config) - set(HIFLOAT8_DEFAULT))
+    if unknown:
+        raise DeepSpeedConfigError(f"Unknown '{HIFLOAT8}' fields: {unknown}")
+
+    result = dict(HIFLOAT8_DEFAULT)
+    result.update(config)
+    if not isinstance(result["enabled"], bool):
+        raise DeepSpeedConfigError("'hifloat8.enabled' must be a boolean")
+    if not isinstance(result["backend"], str) or not result["backend"]:
+        raise DeepSpeedConfigError("'hifloat8.backend' must be a non-empty string")
+    policy = result["config"]
+    if policy is not None and not isinstance(policy, dict):
+        raise DeepSpeedConfigError("'hifloat8.config' must be an object or null")
+    patterns = result["module_name_patterns"]
+    if not isinstance(patterns,
+                      (list, tuple)) or not all(isinstance(pattern, str) and pattern for pattern in patterns):
+        raise DeepSpeedConfigError("'hifloat8.module_name_patterns' must be a list of non-empty strings")
+    if result["enabled"] and not patterns:
+        raise DeepSpeedConfigError("'hifloat8.module_name_patterns' cannot be empty when HiFloat8 is enabled")
+    min_numel = result["min_numel"]
+    if isinstance(min_numel, bool) or not isinstance(min_numel, int) or min_numel < 0:
+        raise DeepSpeedConfigError("'hifloat8.min_numel' must be a non-negative integer")
+    expected_count = result["expected_module_count"]
+    if expected_count is not None and (isinstance(expected_count, bool) or not isinstance(expected_count, int)
+                                       or expected_count <= 0):
+        raise DeepSpeedConfigError("'hifloat8.expected_module_count' must be a positive integer or null")
+    result["module_name_patterns"] = tuple(patterns)
+    return result
+
+
 def get_expert_data_topo_config(param_dict):
     return get_scalar_param(param_dict, USE_DATA_BEFORE_EXPERT_PARALLEL, USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT)
 
@@ -536,6 +589,7 @@ class DeepSpeedConfig(object):
 
         self.use_data_before_expert_parallel_ = get_expert_data_topo_config(param_dict)
         self.hybrid_engine = get_hybrid_engine_config(param_dict)
+        self.hifloat8_config = get_hifloat8_config(param_dict)
 
         self.pipeline = get_pipeline_config(param_dict)
 

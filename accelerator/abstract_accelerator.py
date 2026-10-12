@@ -230,6 +230,36 @@ class DeepSpeedAccelerator(ABC):
     def get_external_grouped_mm_fn(self, precision=None):
         return None
 
+    # Optional HiFloat8 low-precision training backend. The engine calls these
+    # hooks only when the user explicitly enables the ``hifloat8`` training
+    # config; the defaults raise so an explicit request fails closed on
+    # platforms that provide no backend (there is no silent fallback for an
+    # opt-in precision change).
+    #
+    # ``assert_hifloat8_supported`` probes the backend before any module is
+    # mutated; ``linear``/``grouped`` tell the backend which kinds of modules
+    # the engine selected. ``convert_hifloat8_linears`` replaces the named
+    # ``torch.nn.Linear`` modules with HiFloat8 equivalents (conversion may
+    # replace the module tree, so the returned module is authoritative) and
+    # receives the optional user policy from ``hifloat8.config``.
+    def assert_hifloat8_supported(self, device=None, config=None, linear=False, grouped=False):
+        raise RuntimeError(f"HiFloat8 training is not supported by the {self._name} accelerator")
+
+    def convert_hifloat8_linears(self, module, names, config=None):
+        raise RuntimeError(f"HiFloat8 training is not supported by the {self._name} accelerator")
+
+    # AutoEP permutation-index generation. ``prefer_cpu_permutation_indices``
+    # asks whether the host reference path should generate the indices for a
+    # given device and group count; ``prefer_torch_permutation_indices`` asks
+    # whether the device-side generation should use the pure-PyTorch
+    # implementation instead of a Triton kernel. Both default to the
+    # conservative choices so backends opt in explicitly.
+    def prefer_cpu_permutation_indices(self, device_type, group_count):
+        return device_type == "cpu"
+
+    def prefer_torch_permutation_indices(self, device_type):
+        return False
+
     # Graph operations
     @abc.abstractmethod
     def create_graph(self):
