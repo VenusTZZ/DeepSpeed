@@ -4,6 +4,7 @@
 # DeepSpeed Team
 import importlib
 import inspect
+import os
 
 from .abstract_accelerator import DeepSpeedAccelerator
 # During setup stage torch may not be installed, pass on no torch will
@@ -350,3 +351,15 @@ class NPU_Accelerator(DeepSpeedAccelerator):
         else:
             raise ValueError(
                 f"{backend} not supported by {self.device_name()}. Supported Backends are {supported_backends }")
+
+    def get_external_grouped_mm_fn(self, precision=None):
+        # The MoE grouped GEMM provided by torchao_npu (Ascend NPU). The
+        # precision is configured through DS_NPU_GROUPED_MM_PRECISION
+        # ("bf16" by default, "hifloat8" to opt in); configurations the
+        # current hardware cannot run degrade to a plain-torch fallback.
+        # The implementation and its torchao_npu dependency are contained in
+        # op_builder.
+        if precision is None:
+            precision = os.environ.get("DS_NPU_GROUPED_MM_PRECISION", "bf16")
+        from op_builder.npu.grouped_mm import get_external_grouped_mm_fn as _get_fn
+        return _get_fn(precision)

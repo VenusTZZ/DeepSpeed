@@ -215,6 +215,21 @@ class DeepSpeedAccelerator(ABC):
     def prefer_triton_grouped_mm(self):
         return False
 
+    # Optional accelerator-provided grouped GEMM for MoE experts, e.g. an
+    # external low-precision backend. Returns a callable
+    # ``fn(x, weight, offsets) -> out`` computing the grouped ``x @ weight``
+    # with x [M, K], weight [E, K, N] in GEMM layout and offsets [E] int32
+    # cumulative end offsets on the device, or None when the backend provides
+    # no implementation (callers then fall back to the built-in paths).
+    #
+    # The GEMM precision is the backend's own concern: backends select it
+    # from their configuration (``precision`` is an optional caller hint)
+    # and must return a callable that works on the current hardware,
+    # degrading internally when a configured precision is unsupported.
+    # Defaults to None so backends opt in explicitly.
+    def get_external_grouped_mm_fn(self, precision=None):
+        return None
+
     # Graph operations
     @abc.abstractmethod
     def create_graph(self):

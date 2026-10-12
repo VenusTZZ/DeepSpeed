@@ -296,6 +296,41 @@ def _run_experts_triton_grouped_mm(
 
 
 # ---------------------------------------------------------------------------
+# Expert computation: external grouped GEMM (accelerator-provided backend)
+# ---------------------------------------------------------------------------
+
+
+def _run_experts_external_grouped_mm(
+    grouped_mm_fn,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    activation: str = "swiglu",
+    alpha: float = 1.702,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """Compute SwiGLU expert MLP via the accelerator's external grouped GEMM.
+
+    ``grouped_mm_fn`` is the callable returned by
+    ``get_accelerator().get_external_grouped_mm_fn()``; its contract is
+    ``fn(x, weight, offsets) -> out`` with ``weight`` in ``[E, K, N]`` GEMM
+    layout, i.e. the stored ``[E, N, K]`` expert weights transposed. This
+    function is device-agnostic: it only calls the provided callable.
+    """
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+    dtype = x.dtype
+    gate = grouped_mm_fn(x, w1.to(dtype).transpose(-2, -1), offsets)
+    up = grouped_mm_fn(x, w3.to(dtype).transpose(-2, -1), offsets)
+    h = apply_expert_activation(gate, up, activation, alpha, limit)
+    out = grouped_mm_fn(h, w2.to(dtype).transpose(-2, -1), offsets).type_as(x)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # GroupedExperts module
 # ---------------------------------------------------------------------------
 
@@ -303,17 +338,24 @@ def _run_experts_triton_grouped_mm(
 class GroupedExperts(nn.Module):
     """Grouped expert computation for MoE layers.
 
-    Supports three execution paths:
+    Supports four execution paths:
       - **triton_grouped_mm**: Uses a Triton grouped-GEMM kernel
         (``deepspeed.ops.triton_ops.group_gemm_triton``). Auto-selected on sm80/sm86 where
         ``torch._grouped_mm`` would otherwise fall back to a slow per-group loop.
+      - **external_grouped_mm**: Uses an accelerator-provided grouped GEMM
+        (``get_accelerator().get_external_grouped_mm_fn()``), e.g. torchao_npu
+        on Ascend NPU. The backend selects the GEMM precision and must
+        return a callable that works on the current hardware, degrading
+        internally when a configured precision is unsupported. Selected
+        when the Triton path is not.
       - **grouped_mm**: Uses ``torch._grouped_mm`` for fused grouped GEMM
         (requires a sufficiently recent PyTorch build).
       - **for-loop**: Sequential per-expert matmuls; always available.
 
-    If ``use_grouped_mm=True`` but neither the Triton path nor
-    ``torch._grouped_mm`` is available, the constructor raises ``RuntimeError``.
-    Set ``use_grouped_mm=False`` to select the sequential for-loop path.
+    If ``use_grouped_mm=True`` but none of the Triton path, an
+    accelerator-provided backend, or ``torch._grouped_mm`` is available, the
+    constructor raises ``RuntimeError``. Set ``use_grouped_mm=False`` to
+    select the sequential for-loop path.
 
     Args:
         dim (int): Input / output dimension.
@@ -356,6 +398,7 @@ class GroupedExperts(nn.Module):
         self.w3.is_expert_group = True
         self.use_triton_grouped_mm = False
         self.use_grouped_mm = use_grouped_mm
+        self.external_grouped_mm_fn = None
 
         # Resolve the Triton path. The device-specific decision is delegated to
         # the accelerator backend (e.g. the CUDA backend prefers Triton on
@@ -364,11 +407,19 @@ class GroupedExperts(nn.Module):
         if use_grouped_mm and not disable_triton_grouped_mm:
             self.use_triton_grouped_mm = get_accelerator().prefer_triton_grouped_mm()
 
-        if use_grouped_mm and not hasattr(torch, "_grouped_mm") and not self.use_triton_grouped_mm:
+        # Resolve the accelerator-provided grouped GEMM backend (e.g.
+        # torchao_npu on Ascend NPU). Only consulted when the Triton path
+        # was not selected.
+        if use_grouped_mm and not self.use_triton_grouped_mm:
+            self.external_grouped_mm_fn = get_accelerator().get_external_grouped_mm_fn()
+
+        if (use_grouped_mm and not hasattr(torch, "_grouped_mm") and not self.use_triton_grouped_mm
+                and self.external_grouped_mm_fn is None):
             raise RuntimeError("GroupedExperts was constructed with use_grouped_mm=True but "
-                               "torch._grouped_mm is not available in this PyTorch build. "
-                               "Upgrade PyTorch to a build that provides torch._grouped_mm, install "
-                               "Triton to enable the Triton grouped-GEMM path, or set "
+                               "torch._grouped_mm is not available in this PyTorch build and no "
+                               "accelerator-provided grouped GEMM backend is available. Upgrade "
+                               "PyTorch to a build that provides torch._grouped_mm, install Triton "
+                               "to enable the Triton grouped-GEMM path, or set "
                                "use_grouped_mm=False to use the sequential expert loop.")
 
         if use_grouped_mm and self.use_triton_grouped_mm:
@@ -394,6 +445,9 @@ class GroupedExperts(nn.Module):
         act = (self.activation, self.activation_alpha, self.activation_limit)
         if self.use_triton_grouped_mm:
             return _run_experts_triton_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert, *act)
+        elif self.external_grouped_mm_fn is not None:
+            return _run_experts_external_grouped_mm(self.external_grouped_mm_fn, self.w1, self.w2, self.w3, x,
+                                                    num_tokens_per_expert, *act)
         elif self.use_grouped_mm:
             return _run_experts_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert, *act)
         else:
