@@ -1029,8 +1029,9 @@ class TestAutoEPConfig:
         assert preset_name_for_hf_model_type("minimax_m3_vl_text") == "minimax_m3"
         assert preset_name_for_hf_model_type("llama4_text") is None
 
-        assert preset_name_for_hf_model_type("qwen3_5_moe") == "qwen3_5_moe"
-        assert unsupported_preset_for_hf_model_type("qwen3_5_moe") is None
+        qwen35 = unsupported_preset_for_hf_model_type("qwen3_5_moe")
+        assert qwen35 is not None
+        assert "qwen3_5_moe_text" in qwen35[1].unsupported_hf_model_type_notes["qwen3_5_moe"]
         minimax = unsupported_preset_for_hf_model_type("minimax_m3_vl")
         assert minimax is not None
         assert "minimax_m3_vl_text" in minimax[1].unsupported_hf_model_type_notes["minimax_m3_vl"]
@@ -1748,9 +1749,7 @@ def async_split_layer(monkeypatch):
                                   Event=create_event,
                                   Stream=lambda device: stream,
                                   stream=copy_stream,
-                                  pin_memory=pin_memory,
-                                  prefer_cpu_permutation_indices=lambda device_type, group_count: True,
-                                  prefer_torch_permutation_indices=lambda device_type: False)
+                                  pin_memory=pin_memory)
 
     def device_counts(_module, _inputs, output):
         scores, selected, counts = output
@@ -2174,9 +2173,8 @@ class TestModelDetectionAndReplacement:
         assert specs[0].model_family == "qwen3_moe"
 
         model.config.model_type = "qwen3_5_moe"
-        monkeypatch.setattr(get_preset_adapter("qwen3_5_moe"), "_installed_transformers_version", lambda: "5.16.1")
-        specs = AutoEP(model, _runtime_config(enabled=True, autoep_size=1)).ep_parser()
-        assert specs[0].model_family == "qwen3_5_moe"
+        with pytest.raises(ValueError, match="qwen3_5_moe_text"):
+            AutoEP(model, _runtime_config(enabled=True, autoep_size=1))._resolve_presets()
 
     def test_deepseek_v3_detection_and_score_correction_bias_copy(self, monkeypatch):
         FakeGatheredParameters.calls = []

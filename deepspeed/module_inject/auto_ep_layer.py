@@ -404,10 +404,9 @@ def permute_by_local_expert(
     x_padded_per_expert = n_tokens + num_local_experts * alignment
     padded_max_len = ((x_padded_per_expert + alignment - 1) // alignment) * alignment
 
-    # The CPU/host-vs-device decision for index generation is delegated to the
-    # accelerator backend (host tensors always use the host reference path).
-    use_cpu = get_accelerator().prefer_cpu_permutation_indices(local_counts_flat.device.type,
-                                                               local_counts_flat.numel())
+    # Use the pure-PyTorch path for host tensors. The CPU accelerator reports
+    # CPU tensors as "on accelerator", but Triton still requires a GPU driver.
+    use_cpu = tokens.device.type == "cpu"
     counts_for_permute = local_counts_flat.cpu() if use_cpu else local_counts_flat
     with torch.no_grad():
         permuted_indices, m_sizes, _offsets = generate_permute_indices(
@@ -418,7 +417,7 @@ def permute_by_local_expert(
             alignment,
             use_cpu=use_cpu,
         )
-    if tokens.device.type != "cpu":
+    if not use_cpu:
         permuted_indices = permuted_indices.to(tokens.device)
         m_sizes = m_sizes.to(tokens.device)
 
@@ -595,8 +594,6 @@ class AutoEPMoELayer(nn.Module):
                 route_scale=spec.route_scale,
                 gate_bias=spec.gate_bias,
                 group_score_func=spec.group_score_func,
-                topk_sorted=spec.router_topk_sorted,
-                scores_in_input_dtype=spec.router_scores_in_input_dtype,
             )
             # Copy gate weights
             _copy_parameter_data(self.router.gate.weight, source_gate.weight)

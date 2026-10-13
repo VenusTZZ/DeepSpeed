@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""NPU HiFloat8 backend for the engine-level ``hifloat8`` training config.
+"""NPU HiFloat8 backend for the engine-level ``low_precision_training`` config.
 
 torchao_npu ships the HiFloat8 GEMM primitives (``_quantize`` /
 ``hifloat8_matmul``) and a ``HiFloat8Linear`` drop-in for ordinary
-``nn.Linear`` modules. Newer releases additionally provide a training
-helper (``HiFloat8Config`` / ``assert_hifloat8_training_available`` /
-``convert_to_hifloat8_training``) that owns policy-aware conversion;
-when it is present this backend delegates to it, and otherwise it
-assembles the same behavior from the shipped primitives.
+``nn.Linear`` modules; this backend assembles the engine-side training
+behavior (kernel probe + Linear conversion) from those shipped pieces.
 
 All torchao_npu usage is contained in this file; it is only reached
 through ``get_accelerator()`` hooks, so the engine and the other
@@ -35,11 +32,11 @@ def _hifloat8_supported():
 def _import_hifloat8():
     """Import torchao_npu.hifloat8, raising a clear RuntimeError on absence."""
     if importlib.util.find_spec("torchao_npu") is None:
-        raise RuntimeError("HiFloat8 training requires the torchao_npu backend, which is not installed")
+        raise RuntimeError("Low-precision training requires the torchao_npu backend, which is not installed")
     try:
         import torchao_npu  # noqa: F401  activation patches torchao on import
     except Exception as error:
-        raise RuntimeError(f"torchao_npu import failed before HiFloat8 conversion: {error}") from error
+        raise RuntimeError(f"torchao_npu import failed before low-precision conversion: {error}") from error
     try:
         from torchao_npu import hifloat8
     except ImportError as error:
@@ -47,25 +44,20 @@ def _import_hifloat8():
     return hifloat8
 
 
-def assert_hifloat8_supported(device=None, config=None, linear=False, grouped=False):
+def assert_hifloat8_supported(config=None):
     """Raise RuntimeError when the installed backend cannot run HiFloat8 here.
 
     The engine calls this before any module is mutated, so an unsupported
-    request fails without touching the model.
+    request fails without touching the model. The installed torchao_npu has
+    no per-field policy support, so a non-empty ``config`` policy is reported
+    and ignored.
     """
     hifloat8 = _import_hifloat8()
-    if hasattr(hifloat8, "assert_hifloat8_training_available"):
-        # Newer torchao_npu releases own the policy-aware probe (including
-        # per-field validation of ``config``).
-        policy = hifloat8.HiFloat8Config.from_dict(config) if hasattr(hifloat8, "HiFloat8Config") else None
-        return hifloat8.assert_hifloat8_training_available(device=device,
-                                                           config=policy,
-                                                           linear=linear,
-                                                           grouped=grouped)
     if config:
-        logger.warning("installed torchao_npu has no HiFloat8 policy support; 'hifloat8.config' is ignored")
+        logger.warning("installed torchao_npu has no policy support; the low_precision_training 'config' "
+                       "policy is ignored")
     if not _hifloat8_supported():
-        raise RuntimeError("HiFloat8 training requested but the HiFloat8 kernels are not available "
+        raise RuntimeError("Low-precision training requested but the HiFloat8 kernels are not available "
                            "on this hardware")
     return None
 
@@ -73,28 +65,22 @@ def assert_hifloat8_supported(device=None, config=None, linear=False, grouped=Fa
 def convert_hifloat8_linears(module, names, config=None):
     """Replace the named ``nn.Linear`` modules with HiFloat8 equivalents.
 
-    ``names`` are dotted module paths selected by the engine; the returned
-    module is authoritative (newer backends may rebuild the tree).
+    ``names`` are dotted module paths selected by the engine. The
+    ``HiFloat8Linear`` drop-in rebinds the original Parameter objects, so
+    parameter identity and state-dict keys are preserved.
     """
     if not names:
         return module
     hifloat8 = _import_hifloat8()
-    if hasattr(hifloat8, "convert_to_hifloat8_training"):
-        # Newer torchao_npu releases own the conversion.
-        policy = hifloat8.HiFloat8Config.from_dict(config) if hasattr(hifloat8, "HiFloat8Config") else None
-        selected = set(names)
-        return hifloat8.convert_to_hifloat8_training(module, policy, filter_fn=lambda _m, name: name in selected)
-    # torchao_npu 0.18: swap in the shipped HiFloat8Linear drop-in, which
-    # rebinds the original Parameter objects (so parameter identity and
-    # state-dict keys are preserved).
     if config:
-        logger.warning("installed torchao_npu has no HiFloat8 policy support; 'hifloat8.config' is ignored")
+        logger.warning("installed torchao_npu has no policy support; the low_precision_training 'config' "
+                       "policy is ignored")
     for name in names:
         parent_name, _, child_name = name.rpartition(".")
         parent = module if not parent_name else module.get_submodule(parent_name)
         original = getattr(parent, child_name)
         if type(original) is not torch.nn.Linear:
-            raise RuntimeError(f"HiFloat8 conversion expected nn.Linear at '{name}', got "
+            raise RuntimeError(f"Low-precision conversion expected nn.Linear at '{name}', got "
                                f"{type(original).__name__}")
         setattr(parent, child_name, hifloat8.HiFloat8Linear.from_float(original))
     return module

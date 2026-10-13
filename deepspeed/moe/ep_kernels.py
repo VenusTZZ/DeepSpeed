@@ -115,20 +115,10 @@ def fill_indices_wrapper(
     block_size: int = 128,
     max_blocks: int = 1024,
 ) -> torch.Tensor:
-    """Fill permutation indices with the available device implementation.
+    """Launch the Triton kernel to fill permutation indices.
 
     Falls back to :func:`fill_indices_cpu` when Triton is unavailable.
     """
-    from deepspeed.accelerator import get_accelerator
-    if get_accelerator().prefer_torch_permutation_indices(tokens_per_expert_group.device.type):
-        return fill_indices_torch(
-            tokens_per_expert_group,
-            start_index_values,
-            write_offsets,
-            experts_per_rank,
-            num_ranks,
-            max_len,
-        )
     if not _TRITON_AVAILABLE:
         return fill_indices_cpu(
             tokens_per_expert_group,
@@ -190,35 +180,6 @@ def fill_indices_cpu(
                 )
             write_start += length
     return permuted_indices
-
-
-def fill_indices_torch(
-    tokens_per_expert_group: torch.Tensor,
-    start_index_values: torch.Tensor,
-    write_offsets: torch.Tensor,
-    experts_per_rank: int,
-    num_ranks: int,
-    max_len: int,
-) -> torch.Tensor:
-    """Build the padded permutation with device tensors (no Triton kernel).
-
-    Pure-PyTorch equivalent of :func:`fill_indices_cpu` for tensors that
-    already live on the device; AutoEP supplies ``max_len >= token count``.
-    """
-    counts = tokens_per_expert_group.to(torch.int64)
-    source_ends = start_index_values + counts
-    source_prefix = (counts.view(num_ranks, experts_per_rank).cumsum(0) -
-                     counts.view(num_ranks, experts_per_rank)).reshape(-1)
-    source_rows = torch.arange(max_len, device=counts.device, dtype=torch.int64)
-    valid = source_rows < source_ends[-1]
-    group_ids = torch.searchsorted(source_ends, source_rows, right=True).clamp_max(counts.numel() - 1)
-    expert_ids = group_ids.remainder(experts_per_rank)
-    destinations = (write_offsets[expert_ids] + source_prefix[group_ids] + source_rows - start_index_values[group_ids])
-    # Extra slot absorbs all rows beyond the real token count; it is discarded.
-    destinations = torch.where(valid, destinations, max_len).to(torch.int64)
-    result = torch.full((max_len + 1, ), -1, dtype=torch.int32, device=counts.device)
-    result.scatter_(0, destinations, source_rows.to(torch.int32))
-    return result[:-1]
 
 
 # ===================================================================

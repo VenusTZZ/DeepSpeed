@@ -26,10 +26,6 @@ ACL_SUCCESS = 0
 # https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/API/runtimeapi/aclcppdevg_03_2128.html
 ACL_HOST_REG_MAPPED = 0x2
 
-# Below this many source/expert groups, device launch overhead dominates the
-# host reference path for AutoEP permutation-index generation.
-NPU_DEVICE_PERMUTE_MIN_GROUPS = 64
-
 
 def _npu_host_copy_funcs():
     """Resolve the npurt host-registration functions, or (None, reason).
@@ -251,15 +247,6 @@ class NPU_Accelerator(DeepSpeedAccelerator):
     def is_triton_supported(self):
         return False
 
-    def prefer_cpu_permutation_indices(self, device_type, group_count):
-        # Small NPU groups retain the lower-latency host reference path.
-        return device_type == "cpu" or (device_type == "npu" and group_count < NPU_DEVICE_PERMUTE_MIN_GROUPS)
-
-    def prefer_torch_permutation_indices(self, device_type):
-        # The device-side permutation indices are built with the pure-PyTorch
-        # implementation on NPU.
-        return device_type == "npu"
-
     # Graph operations
     def create_graph(self):
         return torch.npu.NPUGraph()
@@ -372,18 +359,23 @@ class NPU_Accelerator(DeepSpeedAccelerator):
         # current hardware cannot run degrade to a plain-torch fallback.
         # The implementation and its torchao_npu dependency are contained in
         # op_builder.
+        if precision == "low_precision":
+            # The generic low-precision training token used by the engine
+            # maps to this backend's native low-precision format.
+            precision = "hifloat8"
         if precision is None:
             precision = os.environ.get("DS_NPU_GROUPED_MM_PRECISION", "bf16")
         from op_builder.npu.grouped_mm import get_external_grouped_mm_fn as _get_fn
         return _get_fn(precision)
 
-    def assert_hifloat8_supported(self, device=None, config=None, linear=False, grouped=False):
-        # The engine-level HiFloat8 training backend (torchao_npu). Probing
-        # before any module is mutated keeps an unsupported request failing
-        # closed; the implementation lives in op_builder.
+    def assert_low_precision_training_supported(self, config=None):
+        # The engine-level low-precision (HiFloat8) training backend backed by
+        # torchao_npu. Probing before any module is mutated keeps an
+        # unsupported request failing closed; the implementation lives in
+        # op_builder.
         from op_builder.npu.hifloat8 import assert_hifloat8_supported as _assert
-        return _assert(device=device, config=config, linear=linear, grouped=grouped)
+        return _assert(config=config)
 
-    def convert_hifloat8_linears(self, module, names, config=None):
+    def convert_linears_to_low_precision(self, module, names, config=None):
         from op_builder.npu.hifloat8 import convert_hifloat8_linears as _convert
         return _convert(module, names, config=config)

@@ -372,10 +372,10 @@ def get_hybrid_engine_config(param_dict):
     return hybrid_engine_config
 
 
-HIFLOAT8 = "hifloat8"
-HIFLOAT8_DEFAULT = {
+LOW_PRECISION_TRAINING = "low_precision_training"
+LOW_PRECISION_TRAINING_DEFAULT = {
     "enabled": False,
-    "backend": "torchao_npu",
+    "backend": None,
     "module_name_patterns": (),
     "min_numel": 0,
     "expected_module_count": None,
@@ -383,44 +383,46 @@ HIFLOAT8_DEFAULT = {
 }
 
 
-def get_hifloat8_config(param_dict):
-    """Parse the ``hifloat8`` low-precision training block.
+def get_low_precision_training_config(param_dict):
+    """Parse the ``low_precision_training`` low-precision training block.
 
-    This validates the block structure only. The ``backend`` value is a
-    contract between the JSON and the accelerators: which backends exist and
-    whether the current platform can run them is checked at engine setup
-    through ``get_accelerator()`` hooks, so no backend name is hardcoded here.
+    This validates the block structure only. The ``backend`` value names a
+    backend implementation; which backends exist and whether the current
+    platform can run them is checked at engine setup through
+    ``get_accelerator()`` hooks, so no backend name is hardcoded here.
+    ``backend: null`` selects the platform's own backend.
     """
-    config = param_dict.get(HIFLOAT8, {})
+    config = param_dict.get(LOW_PRECISION_TRAINING, {})
     if not isinstance(config, dict):
-        raise DeepSpeedConfigError(f"'{HIFLOAT8}' must be an object, got {type(config).__name__}")
+        raise DeepSpeedConfigError(f"'{LOW_PRECISION_TRAINING}' must be an object, got {type(config).__name__}")
 
-    unknown = sorted(set(config) - set(HIFLOAT8_DEFAULT))
+    unknown = sorted(set(config) - set(LOW_PRECISION_TRAINING_DEFAULT))
     if unknown:
-        raise DeepSpeedConfigError(f"Unknown '{HIFLOAT8}' fields: {unknown}")
+        raise DeepSpeedConfigError(f"Unknown '{LOW_PRECISION_TRAINING}' fields: {unknown}")
 
-    result = dict(HIFLOAT8_DEFAULT)
+    result = dict(LOW_PRECISION_TRAINING_DEFAULT)
     result.update(config)
     if not isinstance(result["enabled"], bool):
-        raise DeepSpeedConfigError("'hifloat8.enabled' must be a boolean")
-    if not isinstance(result["backend"], str) or not result["backend"]:
-        raise DeepSpeedConfigError("'hifloat8.backend' must be a non-empty string")
+        raise DeepSpeedConfigError("'low_precision_training.enabled' must be a boolean")
+    if result["backend"] is not None and (not isinstance(result["backend"], str) or not result["backend"]):
+        raise DeepSpeedConfigError("'low_precision_training.backend' must be a non-empty string or null")
     policy = result["config"]
     if policy is not None and not isinstance(policy, dict):
-        raise DeepSpeedConfigError("'hifloat8.config' must be an object or null")
+        raise DeepSpeedConfigError("'low_precision_training.config' must be an object or null")
     patterns = result["module_name_patterns"]
     if not isinstance(patterns,
                       (list, tuple)) or not all(isinstance(pattern, str) and pattern for pattern in patterns):
-        raise DeepSpeedConfigError("'hifloat8.module_name_patterns' must be a list of non-empty strings")
+        raise DeepSpeedConfigError("'low_precision_training.module_name_patterns' must be a list of non-empty strings")
     if result["enabled"] and not patterns:
-        raise DeepSpeedConfigError("'hifloat8.module_name_patterns' cannot be empty when HiFloat8 is enabled")
+        raise DeepSpeedConfigError(
+            "'low_precision_training.module_name_patterns' cannot be empty when low-precision training is enabled")
     min_numel = result["min_numel"]
     if isinstance(min_numel, bool) or not isinstance(min_numel, int) or min_numel < 0:
-        raise DeepSpeedConfigError("'hifloat8.min_numel' must be a non-negative integer")
+        raise DeepSpeedConfigError("'low_precision_training.min_numel' must be a non-negative integer")
     expected_count = result["expected_module_count"]
     if expected_count is not None and (isinstance(expected_count, bool) or not isinstance(expected_count, int)
                                        or expected_count <= 0):
-        raise DeepSpeedConfigError("'hifloat8.expected_module_count' must be a positive integer or null")
+        raise DeepSpeedConfigError("'low_precision_training.expected_module_count' must be a positive integer or null")
     result["module_name_patterns"] = tuple(patterns)
     return result
 
@@ -589,7 +591,7 @@ class DeepSpeedConfig(object):
 
         self.use_data_before_expert_parallel_ = get_expert_data_topo_config(param_dict)
         self.hybrid_engine = get_hybrid_engine_config(param_dict)
-        self.hifloat8_config = get_hifloat8_config(param_dict)
+        self.low_precision_training_config = get_low_precision_training_config(param_dict)
 
         self.pipeline = get_pipeline_config(param_dict)
 
