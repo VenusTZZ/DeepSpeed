@@ -667,6 +667,19 @@ class DeepSpeedEngine(Module):
         # Configure distributed model
         self._configure_distributed_model(model)
 
+        # The low-precision conversion may have replaced modules with new
+        # parameter objects; re-point a caller-supplied optimizer / parameter
+        # list at the converted parameters (the same remap AutoEP uses) before
+        # `_configure_optimizer` consumes them.
+        low_precision_sources = getattr(self, "_low_precision_replacement_sources", None)
+        if low_precision_sources is not None:
+            _remap_client_optimizer_after_module_replacement(self.client_optimizer, model, low_precision_sources)
+            if eager_model_parameters:
+                _remap_model_parameters_after_module_replacement(model_parameters, model, low_precision_sources)
+            # Only the remap needs it; drop the references to the discarded
+            # parameters before ZeRO partitioning allocates.
+            del self._low_precision_replacement_sources
+
         # These hooks should be disabled later if DeepCompile is not active.
         self.module_forward_pre_hook = self._create_module_forward_pre_hook()
         self.module_forward_post_hook = self._create_module_forward_post_hook()
@@ -2252,6 +2265,11 @@ class DeepSpeedEngine(Module):
         Fails closed: every format that matched at least one module is probed
         before any module is mutated, so an unavailable format aborts setup
         without a partially converted model.
+
+        Conversions that replace modules with new parameter objects record what
+        they replaced in ``self._low_precision_replacement_sources``; ``__init__``
+        consumes it to re-point a caller-supplied optimizer / parameter list at
+        the converted parameters (the same remap AutoEP uses).
         """
         quantization_config = self._config.quantization_config
         if not quantization_config.enabled:
@@ -2273,6 +2291,17 @@ class DeepSpeedEngine(Module):
             logger.info(f"Low-precision training format {format_config['type']!r} is available on "
                         f"{accelerator.device_name()}")
 
+        # Capture the direct parameters of every module about to be converted so
+        # module-replacing conversions can map their new parameters back to the
+        # sources a caller-supplied optimizer / parameter list already holds.
+        # In-place adaptations keep parameter identity and map to nothing.
+        from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
+        source_params_by_name = {}
+        for _, names in list(linears.values()) + list(expert_containers.values()):
+            for name in names:
+                target = self.module.get_submodule(name)
+                source_params_by_name[name] = list(target.parameters(recurse=False))
+
         for format_config, names in (value for _, value in linears.items()):
             converted = accelerator.convert_linears_to_low_precision(self.module, names, format_config)
             logger.info(f"Converted {len(converted)} Linear modules to {format_config['type']!r}: {converted}")
@@ -2287,6 +2316,17 @@ class DeepSpeedEngine(Module):
                 module.external_grouped_mm_fn = grouped_mm_fn
             logger.info(f"Assigned {format_config['type']!r} grouped GEMM to {len(modules)} GroupedExperts "
                         f"modules: {[name for name, _ in modules]}")
+
+        replacement_sources = ReplacementSourceMap()
+        for name, old_params in source_params_by_name.items():
+            new_params = list(self.module.get_submodule(name).parameters(recurse=False))
+            if len(new_params) == len(old_params) and all(id(n) == id(o) for n, o in zip(new_params, old_params)):
+                continue  # in-place adaptation: parameter identity unchanged, nothing to remap
+            for param in old_params:
+                replacement_sources.discarded.add(id(param))
+            for param in new_params:
+                replacement_sources.sources[id(param)] = old_params
+        self._low_precision_replacement_sources = replacement_sources
 
     def _validate_zero3_moe_compatibility(self):
         if not self.has_moe_layers:
