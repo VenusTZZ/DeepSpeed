@@ -506,6 +506,54 @@ class _EngineBackwardGraphTracker:
 _ENGINE_BACKWARD_GRAPH_TRACKER = _EngineBackwardGraphTracker()
 
 
+def _collect_low_precision_modules(module, quantization_config):
+    """Bucket the modules matched by the ``quantization`` config section.
+
+    Only modules with direct parameters participate: containers are skipped
+    (their leaves are matched individually), parameter-free modules (e.g.
+    activations) are out of scope, and any other matched parameterized module
+    (e.g. an embedding) fails closed. GroupedExperts and Linear modules are
+    bucketed per format config for the engine's conversion step.
+
+    Args:
+        module: Root model module.
+        quantization_config: ``QuantizationConfig`` from the ds config.
+
+    Returns:
+        ``(linears, grouped_experts, expert_containers)``: dicts keyed by
+        ``repr(format_config)`` whose values are ``(format_config, [module
+        names])``, ``(format_config, [(name, module)])`` and
+        ``(format_config, [module names])`` respectively.
+    """
+    from deepspeed.moe.ep_experts import GroupedExperts
+
+    linears = {}
+    grouped_experts = {}
+    expert_containers = {}
+    for name, module in module.named_modules():
+        direct_params = list(module.parameters(recurse=False))
+        if not direct_params:
+            continue
+        format_config = quantization_config.match_module(name)
+        if format_config is None:
+            continue
+        if isinstance(module, GroupedExperts):
+            grouped_experts.setdefault(repr(format_config), (format_config, []))[1].append((name, module))
+        elif isinstance(module, torch.nn.Linear):
+            linears.setdefault(repr(format_config), (format_config, []))[1].append(name)
+        elif all(p.ndim == 3 for p in direct_params):
+            # Fused expert containers with 3-D expert weights (e.g. transformers
+            # 5.x Qwen2MoeExperts / DeepseekV3Experts). The backend decides how
+            # to quantize them (or fails closed if the format cannot).
+            expert_containers.setdefault(repr(format_config), (format_config, []))[1].append(name)
+        else:
+            raise RuntimeError(f"Module {name!r} matched a quantization format but is not supported: expected "
+                               f"GroupedExperts, torch.nn.Linear or a fused 3-D expert container, got "
+                               f"{type(module).__name__}. Narrow the quantization patterns to the layers you "
+                               f"want to quantize.")
+    return linears, grouped_experts, expert_containers
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
@@ -2192,6 +2240,53 @@ class DeepSpeedEngine(Module):
 
         if not is_zero_init_model:
             self._broadcast_model()
+
+        # Low-precision training conversion runs after AutoEP replacement,
+        # device placement and the model broadcast, and before optimizer setup
+        # (so the converted modules' parameters are what the optimizer sees).
+        self._configure_low_precision_training()
+
+    def _configure_low_precision_training(self):
+        """Apply the ``quantization`` config section through accelerator hooks.
+
+        Fails closed: every format that matched at least one module is probed
+        before any module is mutated, so an unavailable format aborts setup
+        without a partially converted model.
+        """
+        quantization_config = self._config.quantization_config
+        if not quantization_config.enabled:
+            return
+        linears, grouped_experts, expert_containers = _collect_low_precision_modules(self.module, quantization_config)
+        accelerator = get_accelerator()
+
+        if not linears and not grouped_experts and not expert_containers:
+            logger.warning("The quantization config section matched no modules on this model. Check the "
+                           "module_configs patterns against model.named_modules(); training will run unquantized.")
+            return
+
+        formats = {}
+        for format_config, _ in list(linears.values()) + list(grouped_experts.values()) + list(
+                expert_containers.values()):
+            formats[repr(format_config)] = format_config
+        for format_config in formats.values():
+            accelerator.assert_low_precision_training_supported(format_config)
+            logger.info(f"Low-precision training format {format_config['type']!r} is available on "
+                        f"{accelerator.device_name()}")
+
+        for format_config, names in (value for _, value in linears.items()):
+            converted = accelerator.convert_linears_to_low_precision(self.module, names, format_config)
+            logger.info(f"Converted {len(converted)} Linear modules to {format_config['type']!r}: {converted}")
+
+        for format_config, names in (value for _, value in expert_containers.items()):
+            converted = accelerator.convert_linears_to_low_precision(self.module, names, format_config)
+            logger.info(f"Adapted {len(converted)} fused expert containers to {format_config['type']!r}: {converted}")
+
+        for format_config, modules in (value for _, value in grouped_experts.items()):
+            grouped_mm_fn = accelerator.get_grouped_mm_fn(format_config)
+            for _, module in modules:
+                module.external_grouped_mm_fn = grouped_mm_fn
+            logger.info(f"Assigned {format_config['type']!r} grouped GEMM to {len(modules)} GroupedExperts "
+                        f"modules: {[name for name, _ in modules]}")
 
     def _validate_zero3_moe_compatibility(self):
         if not self.has_moe_layers:

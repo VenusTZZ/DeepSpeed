@@ -353,6 +353,43 @@ def _run_experts_grouped_mm_fused_gate_up(
     return out
 
 
+def _run_experts_external_grouped_mm(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    external_grouped_mm_fn,
+    activation: str = "swiglu",
+    alpha: float = 1.702,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """Compute SwiGLU expert MLP via a backend-supplied grouped-GEMM callable.
+
+    ``external_grouped_mm_fn(x, weight, offsets)`` follows the
+    ``torch._grouped_mm`` weight layout ([E, in, out], no transpose at the
+    call site); the callable is assigned by the engine from the accelerator
+    backend (e.g. a low-precision grouped GEMM from the ``quantization``
+    config section).
+
+    Args:
+        w1, w2, w3, x, num_tokens_per_expert: As in :func:`_run_experts_grouped_mm`.
+        external_grouped_mm_fn: Callable ``(x, weight, offsets) -> out``.
+        activation, alpha, limit: As in :func:`_run_experts_grouped_mm`.
+
+    Returns:
+        Output tensor of shape ``(T, dim)``.
+    """
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+    gate = external_grouped_mm_fn(x, w1.transpose(-2, -1), offsets)
+    up = external_grouped_mm_fn(x, w3.transpose(-2, -1), offsets)
+    h = apply_expert_activation(gate, up, activation, alpha, limit)
+    out = external_grouped_mm_fn(h, w2.transpose(-2, -1), offsets).type_as(x)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Expert computation: Triton grouped GEMM (sm80 / sm86 fast path)
 # ---------------------------------------------------------------------------
@@ -459,6 +496,10 @@ class GroupedExperts(nn.Module):
         self.w3.is_expert_group = True
         self.use_triton_grouped_mm = False
         self.use_grouped_mm = use_grouped_mm
+        # Optional grouped-GEMM callable assigned by the engine from the
+        # accelerator backend (quantization config section); when set, forward
+        # routes every grouped GEMM through it instead of the native paths.
+        self.external_grouped_mm_fn = None
 
         # Resolve the Triton path. The device-specific decision is delegated to
         # the accelerator backend (e.g. the CUDA backend prefers Triton on
@@ -504,7 +545,10 @@ class GroupedExperts(nn.Module):
         """
 
         act = (self.activation, self.activation_alpha, self.activation_limit)
-        if self.use_triton_grouped_mm:
+        if self.external_grouped_mm_fn is not None:
+            return _run_experts_external_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert,
+                                                    self.external_grouped_mm_fn, *act)
+        elif self.use_triton_grouped_mm:
             return _run_experts_triton_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert, *act)
         elif self.use_grouped_mm:
             if self.gate_up_impl == "fused":

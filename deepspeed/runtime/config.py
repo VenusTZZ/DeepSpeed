@@ -4,7 +4,8 @@
 # DeepSpeed Team
 
 import os
-from typing import Union
+import re
+from typing import Any, Dict, Optional, Union
 from enum import Enum
 
 import torch
@@ -12,7 +13,7 @@ import json
 import hjson
 import copy
 import base64
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .constants import *
 from .config_utils import (
@@ -372,6 +373,98 @@ def get_hybrid_engine_config(param_dict):
     return hybrid_engine_config
 
 
+def _validate_quantization_format_config(name, cfg):
+    """Structure checks shared by every format config entry.
+
+    Format configs are otherwise opaque to DeepSpeed: it only requires a
+    ``type`` field identifying the format and passes the rest through verbatim
+    to the backend (e.g. torchao's ``config_from_dict``).
+    """
+    if not isinstance(cfg, dict):
+        raise DeepSpeedConfigError(f"{name} must be a dict, got {type(cfg).__name__}")
+    fmt_type = cfg.get("type")
+    if not isinstance(fmt_type, str) or not fmt_type:
+        raise DeepSpeedConfigError(f"{name} must specify a non-empty string 'type' identifying the format")
+    backend = cfg.get("backend", None)
+    if backend is not None and (not isinstance(backend, str) or not backend):
+        raise DeepSpeedConfigError(f"{name}.backend must be null or a non-empty string, got {backend!r}")
+
+
+class QuantizationConfig(DeepSpeedConfigModel):
+    """``quantization`` section: low-precision training formats with optional
+    per-module overrides.
+
+    Two shapes:
+
+    - Whole-model: ``default`` applies one format config to every module.
+    - Fine-grained: ``module_configs`` maps module FQNs to format configs,
+      with priority exact FQN > regex (``re:`` prefix, fullmatch) > ``_default``.
+
+    The formats are not enumerated in the config layer: any format with a
+    torchao-style config dict can appear in a mapping entry, so new formats
+    (FP8, int8/int4, ...) extend the section without touching its structure.
+    fp16/bf16 stay top-level and apply to modules that match no entry.
+    """
+
+    default: Optional[Dict[str, Any]] = None
+    module_configs: Optional[Dict[str, Optional[Dict[str, Any]]]] = None
+
+    @model_validator(mode="after")
+    def _validate(self):
+        regex_patterns = []
+        if self.default is not None:
+            _validate_quantization_format_config("quantization.default", self.default)
+        if self.module_configs is not None:
+            default_override = None
+            for key, cfg in self.module_configs.items():
+                if key == "_default":
+                    default_override = cfg
+                    if cfg is not None:
+                        _validate_quantization_format_config("quantization.module_configs['_default']", cfg)
+                    continue
+                _validate_quantization_format_config(f"quantization.module_configs[{key}]", cfg)
+                if key.startswith("re:"):
+                    try:
+                        regex_patterns.append((key, re.compile(key[3:])))
+                    except re.error as e:
+                        raise DeepSpeedConfigError(f"Invalid regex in quantization.module_configs key {key!r}: {e}")
+            if "_default" in self.module_configs and self.default is not None and self.default != default_override:
+                raise DeepSpeedConfigError("quantization.default and quantization.module_configs['_default'] "
+                                           "must not conflict")
+        self._regex_patterns = regex_patterns
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.default is not None or (self.module_configs is not None and len(self.module_configs) > 0)
+
+    def match_module(self, fqn: str) -> Optional[Dict[str, Any]]:
+        """Return the format config applying to ``fqn``.
+
+        Priority: exact FQN > regex (``re:`` keys, fullmatch) > ``_default``
+        > ``default``. A null ``_default`` means modules that match nothing
+        keep the top-level fp16/bf16/fp32 precision. Raises if nothing matches
+        and no default is configured.
+        """
+        module_configs = self.module_configs or {}
+        if fqn in module_configs:
+            return module_configs[fqn]
+        for key, pattern in self._regex_patterns:
+            if pattern.fullmatch(fqn):
+                return module_configs[key]
+        if "_default" in module_configs:
+            return module_configs["_default"]
+        if self.default is not None:
+            return self.default
+        raise DeepSpeedConfigError(f"Module {fqn!r} matches no entry in quantization.module_configs and no default "
+                                   f"format is configured")
+
+
+def get_quantization_config(param_dict):
+    quantization_config_dict = param_dict.get("quantization", {})
+    return QuantizationConfig(**quantization_config_dict)
+
+
 def get_expert_data_topo_config(param_dict):
     return get_scalar_param(param_dict, USE_DATA_BEFORE_EXPERT_PARALLEL, USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT)
 
@@ -580,6 +673,8 @@ class DeepSpeedConfig(object):
 
         self.weight_quantization_config = WeightQuantConfig(
             **param_dict['weight_quantization']) if 'weight_quantization' in param_dict else None
+
+        self.quantization_config = get_quantization_config(param_dict)
 
         self.compile_config = CompileConfig(**param_dict.get('compile', {}))
 

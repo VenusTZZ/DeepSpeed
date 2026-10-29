@@ -207,6 +207,22 @@ class DeepSpeedAccelerator(ABC):
     def is_triton_supported(self):
         ...
 
+    # Low-precision training (`quantization` config section). Backends that
+    # implement a format override these three hooks; the defaults fail closed
+    # so a configured-but-unsupported format raises a clear error during
+    # engine setup instead of silently training unquantized.
+    def assert_low_precision_training_supported(self, format_config):
+        raise NotImplementedError(f"Low-precision training is not implemented on the {self.device_name()} "
+                                  f"accelerator (format config: {format_config})")
+
+    def convert_linears_to_low_precision(self, module, names, format_config):
+        raise NotImplementedError(f"Low-precision training is not implemented on the {self.device_name()} "
+                                  f"accelerator (format config: {format_config})")
+
+    def get_grouped_mm_fn(self, format_config):
+        raise NotImplementedError(f"Low-precision training is not implemented on the {self.device_name()} "
+                                  f"accelerator (format config: {format_config})")
+
     # Whether the fused MoE expert path should prefer a Triton grouped-GEMM
     # kernel over ``torch._grouped_mm`` on this accelerator. Backends override
     # this to return True when the Triton path is faster than the native op

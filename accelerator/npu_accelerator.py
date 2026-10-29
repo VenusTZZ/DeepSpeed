@@ -246,6 +246,19 @@ class NPU_Accelerator(DeepSpeedAccelerator):
     def is_triton_supported(self):
         return False
 
+    # Low-precision training
+    def assert_low_precision_training_supported(self, format_config):
+        low_precision = importlib.import_module(self.op_builder_dir() + ".low_precision")
+        return low_precision.assert_low_precision_training_supported(format_config)
+
+    def convert_linears_to_low_precision(self, module, names, format_config):
+        low_precision = importlib.import_module(self.op_builder_dir() + ".low_precision")
+        return low_precision.convert_linears_to_low_precision(module, names, format_config)
+
+    def get_grouped_mm_fn(self, format_config):
+        low_precision = importlib.import_module(self.op_builder_dir() + ".low_precision")
+        return low_precision.get_grouped_mm_fn(format_config)
+
     # Graph operations
     def create_graph(self):
         return torch.npu.NPUGraph()
