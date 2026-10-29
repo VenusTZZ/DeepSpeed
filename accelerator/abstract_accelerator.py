@@ -215,6 +215,14 @@ class DeepSpeedAccelerator(ABC):
     def prefer_triton_grouped_mm(self):
         return False
 
+    # Native grouped GEMM override for the fused MoE expert path: backends that
+    # expose a hardware grouped matmul return its differentiable callable here,
+    # and the expert kernel prefers it over the generic paths
+    # (``torch._grouped_mm`` / Triton). Returns None when the device prefers
+    # the generic paths. Defaults to None so backends opt in explicitly.
+    def prefer_native_grouped_mm(self):
+        return None
+
     # Graph operations
     def is_current_stream_capturing(self) -> bool:
         return False
