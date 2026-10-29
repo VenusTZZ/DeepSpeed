@@ -26,6 +26,13 @@ Degradation discipline: ``get_grouped_mm_fn`` always returns a usable
 callable. If the requested precision is unavailable it degrades to the BF16
 grouped path (with a warning) instead of raising at call time; the fail-closed
 abort for a format happens earlier, in the assert hook.
+
+Backends: a format config may name a backend implementation. ``"torchao"`` is
+the torchao-family implementation - torchao_npu's kernels on Ascend (HiFloat8
+linear and the grouped matmul). The int8 STE quantizer itself is pure torch,
+but it lives inside the same backend and its MoE grouped GEMM runs on
+torchao_npu's grouped matmul. A null backend selects the platform default,
+which is ``"torchao"`` here; any other name fails closed in ``_resolve_format``.
 """
 
 import logging
@@ -42,6 +49,9 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_FORMATS = ("hifloat8", "int8")
+# Named backends this accelerator can serve the supported formats with. A null
+# backend selects the platform default, which is "torchao" here.
+_SUPPORTED_BACKENDS = ("torchao", )
 _HIFLOAT8_INSTALL_HINT = ("HiFloat8 on NPU requires the paired torchao_npu extension; install torchao and torchao_npu "
                           "(matching versions, e.g. 0.18) and import torchao_npu before use.")
 
@@ -61,6 +71,12 @@ def _resolve_format(format_config):
             f"Format {fmt_type!r} is not implemented on the npu accelerator (implemented: "
             f"{list(_SUPPORTED_FORMATS)}). The config layer accepts any format name by design; each backend "
             f"implements a subset and fails closed for the rest.")
+    backend = format_config.get("backend")
+    if backend is not None and backend not in _SUPPORTED_BACKENDS:
+        raise NotImplementedError(
+            f"Backend {backend!r} is not implemented on the npu accelerator (implemented: "
+            f"{list(_SUPPORTED_BACKENDS)}; null selects the platform default 'torchao'). The config layer accepts "
+            f"any backend name by design; each accelerator implements a subset and fails closed for the rest.")
     return fmt_type
 
 
