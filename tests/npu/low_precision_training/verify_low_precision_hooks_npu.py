@@ -39,7 +39,7 @@ def check(cond, label):
 
 
 def hifloat8_cfg():
-    return {"type": "hifloat8", "backend": None}
+    return {"type": "hifloat8", "backend": "torchao"}
 
 
 def ref_grouped_mm(x, weight, offsets):
@@ -123,7 +123,7 @@ def main():
 
     # 6. int8 格式正向路径（910B4 可跑的训练格式，纯 torch + STE）
     log.info("【条目 6】int8 格式（910B4 正向路径）：assert 通过 + grouped mm STE + convert 训练语义")
-    int8_cfg = {"type": "int8", "backend": None}
+    int8_cfg = {"type": "int8", "backend": "torchao"}
     try:
         acc.assert_low_precision_training_supported(int8_cfg)
         check(True, "assert(int8) 通过（纯 torch 格式，无硬件门）")
@@ -180,7 +180,7 @@ def main():
     # 7. int8 group_size 变体
     log.info("【条目 7】int8 group_size 变体：分组网格 + 参数校验")
     try:
-        fn_g = acc.get_grouped_mm_fn({"type": "int8", "backend": None, "group_size": 8})
+        fn_g = acc.get_grouped_mm_fn({"type": "int8", "backend": "torchao", "group_size": 8})
         check(callable(fn_g), "get_grouped_mm_fn(int8, group_size=8) 返回 callable")
         H, O = 16, 32
         offsets = torch.cumsum(torch.tensor([0, 5, 3, 0, 7], dtype=torch.int64), dim=0)[1:]

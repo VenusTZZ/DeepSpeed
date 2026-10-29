@@ -26,7 +26,7 @@ from deepspeed.runtime.config import DeepSpeedConfig  # noqa: E402
 
 
 def hifloat8_cfg():
-    return {"type": "hifloat8", "backend": None}
+    return {"type": "hifloat8", "backend": "torchao"}
 
 
 def ref_grouped_mm(x, weight, offsets):

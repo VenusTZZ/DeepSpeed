@@ -117,12 +117,12 @@ def main():
         base_config(quantization={"module_configs": {
             "re:model\\.layers\\..+\\.mlp\\.experts": {
                 "type": "int8",
-                "backend": None,
+                "backend": "torchao",
                 "group_size": 32
             },
             "re:model\\.layers\\..+\\.mlp\\.shared_expert\\.(gate|up|down)_proj": {
                 "type": "int8",
-                "backend": None,
+                "backend": "torchao",
                 "group_size": 32
             },
             "_default": None,
@@ -143,12 +143,12 @@ def main():
                                         config=base_config(quantization={"module_configs": {
                                             "re:model\\.layers\\..+\\.mlp\\.experts": {
                                                 "type": "int8",
-                                                "backend": None,
+                                                "backend": "torchao",
                                                 "group_size": 32
                                             },
                                             "re:model\\.layers\\..+\\.mlp\\.shared_expert\\.(gate|up|down)_proj": {
                                                 "type": "int8",
-                                                "backend": None,
+                                                "backend": "torchao",
                                                 "group_size": 32
                                             },
                                             "_default": None,

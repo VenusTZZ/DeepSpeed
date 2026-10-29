@@ -96,12 +96,12 @@ def ds_config_dict(quantized):
             "module_configs": {
                 r"re:model\.layers\..+\.mlp\.experts": {
                     "type": "int8",
-                    "backend": None,
+                    "backend": "torchao",
                     "group_size": 32
                 },
                 r"re:model\.layers\..+\.mlp\.shared_expert\.(gate|up|down)_proj": {
                     "type": "int8",
-                    "backend": None,
+                    "backend": "torchao",
                     "group_size": 32
                 },
                 "_default": None,

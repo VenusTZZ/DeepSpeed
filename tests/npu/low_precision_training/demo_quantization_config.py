@@ -85,7 +85,7 @@ def main():
         "train_batch_size": 64,
         "bf16": {"enabled": True},
         "quantization": {
-            "default": {"type": "hifloat8", "backend": None, "group_size": 128},
+            "default": {"type": "hifloat8", "backend": "torchao", "group_size": 128},
         },
     }
     qcfg = DeepSpeedConfig(ds_config).quantization_config
@@ -104,9 +104,9 @@ def main():
                 # 精确 FQN（最高优先级）：只对第 0 层的 q_proj 生效
                 "model.decoder.layers.0.self_attn.q_proj": {"type": "int4wo", "group_size": 64},
                 # 正则（re: 前缀，fullmatch 锚定整串）：所有层的 q/k/v_proj
-                "re:model\\.decoder\\.layers\\..+\\.self_attn\\.[qkv]_proj": {"type": "hifloat8", "backend": None},
+                "re:model\\.decoder\\.layers\\..+\\.self_attn\\.[qkv]_proj": {"type": "hifloat8", "backend": "torchao"},
                 # 正则：所有 MoE 专家模块
-                "re:model\\.decoder\\.layers\\..+\\.moe\\.experts\\.\\d+": {"type": "hifloat8", "backend": None},
+                "re:model\\.decoder\\.layers\\..+\\.moe\\.experts\\.\\d+": {"type": "hifloat8", "backend": "torchao"},
                 # 显式出口：其余模块保持顶层 bf16，不做量化
                 "_default": None,
             },

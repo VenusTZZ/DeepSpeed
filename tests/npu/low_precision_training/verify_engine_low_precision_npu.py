@@ -111,7 +111,7 @@ def main():
     # 2. Dense 正向路径（int8）
     log.info("【条目 2】Dense 正向：int8 命中 Linear → 转换 + 训练")
     model = TinyNet()
-    cfg = base_config(quantization={"default": {"type": "int8", "backend": None}})
+    cfg = base_config(quantization={"default": {"type": "int8", "backend": "torchao"}})
     engine, *_ = deepspeed.initialize(model=model, config=cfg)
     converted = [n for n, m in engine.module.named_modules() if type(m).__name__ == "_Int8GridLinear"]
     check(len(converted) == 2, f"initialize 时已转换 {len(converted)} 个 Linear: {converted}")
@@ -123,7 +123,7 @@ def main():
     # 3. 引擎级 fail-closed（hifloat8 在 910B4）
     log.info("【条目 3】引擎级 fail-closed：hifloat8 → initialize 抛错")
     model = TinyNet()
-    cfg = base_config(quantization={"default": {"type": "hifloat8", "backend": None}})
+    cfg = base_config(quantization={"default": {"type": "hifloat8", "backend": "torchao"}})
     try:
         deepspeed.initialize(model=model, config=cfg)
         check(False, "hifloat8 在 910B4 上 initialize 应失败")
@@ -137,7 +137,7 @@ def main():
     cfg = base_config(quantization={"module_configs": {
         "experts": {
             "type": "int8",
-            "backend": None
+            "backend": "torchao"
         },
         "_default": None,
     }})

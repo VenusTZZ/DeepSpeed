@@ -185,7 +185,7 @@ def main():
 
 
 def experts_quant_config(group_size):
-    fmt = {"type": "int8", "backend": None}
+    fmt = {"type": "int8", "backend": "torchao"}
     if group_size is not None:
         fmt["group_size"] = group_size
     return {"module_configs": {
