@@ -792,7 +792,10 @@ class AllGatherCoalescedHandle:
                                                                 min(param.ds_numel - param_start, ds_tensor_numel))
                     partitions.append(part_to_copy)
             # Note that dtypes of param and partitions can be different (currently for torch.autocast support)
-            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape).to(param.ds_tensor.dtype)
+            # Cast to the parameter's dtype, not the storage dtype: params whose
+            # storage is quantized have an int8 ds_tensor, and casting the
+            # dequantized output back to int8 would corrupt the fetched weights.
+            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape).to(param.dtype)
             param.ds_status = ZeroParamStatus.AVAILABLE
             if not get_accelerator().is_synchronized_device() and handle_dependency:
                 for part_to_copy in partitions:
@@ -1151,7 +1154,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         self.module = module
         if (self.quantized_weights or self.quantized_nontrainable_weights):
-            self.quantizer_module = CUDAQuantizer()
+            # Assign to the class so handles that read Init.quantizer_module (e.g.
+            # NoGatherHandle and NoGatherCoalescedHandle, used on single-rank runs)
+            # can access it; the quantizer itself is a process-wide singleton anyway.
+            Init.quantizer_module = CUDAQuantizer()
             print_rank_0(f'Using quantizer for weights: {self.quantizer_module.__class__.__name__}', force=False)
 
         if _ds_config is not None:
@@ -1489,13 +1495,20 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                     if use_secondary_tensor:
                         if hasattr(params[0].ds_secondary_tensor, "ds_quant_scale"):
-                            quantized_param = instrument_w_nvtx(torch.cat)([
-                                p.ds_secondary_tensor.data.to(get_accelerator().current_device_name()) for p in params
-                            ])
-                            scales = instrument_w_nvtx(torch.cat)([
-                                p.ds_secondary_tensor.ds_quant_scale.to(get_accelerator().current_device_name())
-                                for p in params
-                            ])
+                            # Each param in this bucket carries its own quantized storage
+                            # with its own group count. A single flat dequantize of the
+                            # concatenated per-param scales would compute a wrong
+                            # elems_per_group whenever the group counts differ, so
+                            # dequantize each partition and quantize the whole bucket
+                            # uniformly, mirroring the on-the-fly branch below.
+                            quantized_param, scales = self.quantizer_module.quantize(
+                                instrument_w_nvtx(torch.cat)([
+                                    self.quantizer_module.dequantize(p.ds_secondary_tensor.data.to(
+                                        get_accelerator().current_device_name()),
+                                                                     p.ds_secondary_tensor.ds_quant_scale.to(
+                                                                         get_accelerator().current_device_name()),
+                                                                     dtype=p.dtype) for p in params
+                                ]))
                         else:
                             quantized_param, scales = self.quantizer_module.quantize(
                                 instrument_w_nvtx(torch.cat)([
@@ -1503,11 +1516,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                 ]))
                     else:
                         if hasattr(params[0].ds_tensor, "ds_quant_scale"):
-                            quantized_param = instrument_w_nvtx(torch.cat)(
-                                [p.ds_tensor.data.to(get_accelerator().current_device_name()) for p in params])
-                            scales = instrument_w_nvtx(torch.cat)([
-                                p.ds_tensor.ds_quant_scale.to(get_accelerator().current_device_name()) for p in params
-                            ])
+                            # Each param in this bucket carries its own quantized storage
+                            # with its own group count. A single flat dequantize of the
+                            # concatenated per-param scales would compute a wrong
+                            # elems_per_group whenever the group counts differ, so
+                            # dequantize each partition and quantize the whole bucket
+                            # uniformly, mirroring the on-the-fly branch below.
+                            quantized_param, scales = self.quantizer_module.quantize(
+                                instrument_w_nvtx(torch.cat)([
+                                    self.quantizer_module.dequantize(
+                                        p.ds_tensor.data.to(get_accelerator().current_device_name()),
+                                        p.ds_tensor.ds_quant_scale.to(get_accelerator().current_device_name()),
+                                        dtype=p.dtype) for p in params
+                                ]))
                         else:
                             quantized_param, scales = self.quantizer_module.quantize(
                                 instrument_w_nvtx(torch.cat)(
@@ -1834,10 +1855,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         device = self.remote_device
 
                     partitioned_tensor = torch.empty(partition_size, dtype=param.dtype, device=device)
-                    # quantize the tensor if it's not trainable
-                    if not param.requires_grad and self.quantized_nontrainable_weights:
-                        partitioned_tensor, partitioned_tensor.ds_quant_scale = self.quantizer_module.quantize(
-                            partitioned_tensor)
 
                     if device == OffloadDeviceEnum.cpu and self.pin_memory:
                         partitioned_tensor = get_accelerator().pin_memory(partitioned_tensor)
@@ -1853,6 +1870,16 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             end = start + partition_size
 
             one_dim_param = param.contiguous().view(-1)
+
+            # Un-quantize an existing quantized storage so the copies below write the
+            # real weights into a fp16/bf16 buffer; the storage is re-quantized after
+            # the copies. Copying into the int8 storage directly would truncate the
+            # weights.
+            if hasattr(param.ds_tensor, "ds_quant_scale"):
+                param.ds_tensor.data = self.quantizer_module.dequantize(param.ds_tensor.data,
+                                                                        param.ds_tensor.ds_quant_scale,
+                                                                        dtype=param.dtype)
+                del param.ds_tensor.ds_quant_scale
 
             if start < param.ds_numel and end <= param.ds_numel:
                 src_tensor = one_dim_param.narrow(0, start, partition_size)
@@ -1874,8 +1901,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     with torch.no_grad():
                         # make sure param.ds_tensor requires_grad always be false,
                         # otherwise, torch tracer will complain.
+                        # Zero any uncovered padding so coalesced quantization never sees stale values.
+                        param.ds_tensor.zero_()
                         param.ds_tensor.narrow(0, 0,
                                                elems_to_copy).copy_(one_dim_param.narrow(0, start, elems_to_copy))
+
+            # Quantize the storage only after the real weights have been copied in;
+            # quantizing the uninitialized buffer first would be overwritten by the
+            # copy, which truncates fp16/bf16 weights into the int8 storage.
+            if not param.requires_grad and self.quantized_nontrainable_weights and param.ds_tensor.final_location != OffloadDeviceEnum.nvme:
+                with torch.no_grad():
+                    quantized_storage, scale = self.quantizer_module.quantize(param.ds_tensor.data)
+                param.ds_tensor.data = quantized_storage
+                param.ds_tensor.ds_quant_scale = scale
 
             #print(f"Remote device {self.remote_device}")
 
@@ -1918,10 +1956,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                 if self.pin_memory:
                     secondary_partitioned_tensor = get_accelerator().pin_memory(secondary_partitioned_tensor)
-                # quantize the tensor if it's not trainable
-                if not param.requires_grad and self.quantized_nontrainable_weights:
-                    secondary_partitioned_tensor, secondary_partitioned_tensor.ds_quant_scale = self.quantizer_module.quantize(
-                        secondary_partitioned_tensor)
                 secondary_partitioned_tensor.requires_grad = False
                 param.ds_secondary_tensor = secondary_partitioned_tensor
                 param.ds_secondary_tensor.ds_numel = secondary_partition_size
@@ -1938,6 +1972,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # ds_numel is unpadded, so the last chunk of the secondary tensor might not be secondary_partition_size
             sec_numel = max(0, min(param.ds_numel - secondary_start, secondary_partition_size))
 
+            # Un-quantize an existing quantized storage so the copies below write the
+            # real weights into a fp16/bf16 buffer; the storage is re-quantized after
+            # the copies. Copying into the int8 storage directly would truncate the
+            # weights.
+            if hasattr(param.ds_secondary_tensor, "ds_quant_scale"):
+                param.ds_secondary_tensor.data = self.quantizer_module.dequantize(
+                    param.ds_secondary_tensor.data, param.ds_secondary_tensor.ds_quant_scale, dtype=param.dtype)
+                del param.ds_secondary_tensor.ds_quant_scale
+
             # Zero any uncovered padding so coalesced quantization never sees stale values.
             with torch.no_grad():
                 # make sure param.ds_secondary_tensor requires_grad always be false
@@ -1945,6 +1988,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if sec_numel > 0:
                     param.ds_secondary_tensor.narrow(0, 0, sec_numel).copy_(
                         one_dim_param.narrow(0, secondary_start, sec_numel))
+
+            # Quantize the storage only after the real weights have been copied in;
+            # quantizing the uninitialized buffer first would be overwritten by the
+            # copy, which truncates fp16/bf16 weights into the int8 storage.
+            if not param.requires_grad and self.quantized_nontrainable_weights:
+                with torch.no_grad():
+                    quantized_storage, scale = self.quantizer_module.quantize(param.ds_secondary_tensor.data)
+                param.ds_secondary_tensor.data = quantized_storage
+                param.ds_secondary_tensor.ds_quant_scale = scale
 
             # TODO: This is a temporary fix to avoid the issue that 2nd tensor all-gather happens before 2nd tensor partition is done
             if not get_accelerator().resolves_data_dependency():
