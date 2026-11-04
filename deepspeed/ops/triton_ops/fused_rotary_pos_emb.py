@@ -182,7 +182,7 @@ def _platform_supported(q: torch.Tensor, unsqueeze_dim: int) -> bool:
                                       head_dim,
                                       seq_len,
                                       n_heads,
-                                      shape_key=_probes.probe_rotary_key(head_dim, seq_len, n_heads))
+                                      shape_key=_probes.probe_rotary_key(head_dim, seq_len, n_heads, q.device))
 
 
 def assert_supported(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,

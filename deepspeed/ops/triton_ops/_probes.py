@@ -4,13 +4,15 @@
 # DeepSpeed Team
 """Probe library: one minimal risky usage per Triton kernel.
 
-Every Triton call site validates its kernel through the accelerator's per-kernel
-gate (``deepspeed.ops.triton_ops._triton.is_triton_kernel_supported``) with the
-probe defined here. A probe runs the kernel's smallest representative usage -
-forward and backward where the kernel has one - on the caller's device and
-dtype, so the current backend answers for itself on first use and the answer is
-cached per process. No platform keeps a blacklist, and a backend that gains or
-fixes support flips the gate automatically.
+Every Triton call site validates its kernel through the shared gate
+(``deepspeed.ops.triton_ops._triton.is_triton_kernel_supported``) with the probe
+defined here. A probe runs the kernel's smallest representative usage - forward
+and backward where the kernel has one - on the caller's device and dtype, so the
+current backend answers for itself on first use and the answer is cached per
+process. Callers that pass compile-relevant shape metadata get a probe that
+compiles the same Triton variant production will run; probes that keep a fixed
+smoke shape are support checks only. No platform keeps a blacklist, and a
+backend that gains or fixes support flips the gate automatically.
 
 Kernel modules are imported lazily inside each probe, so this module stays
 import-light and free of import cycles. Probe names follow the module that owns
@@ -103,19 +105,35 @@ def probe_packed_key(inter, n_rows) -> str:
     return f"inter={inter}:{probe_extent_key(out_elements)}"
 
 
-def _probe_seq(seq_len) -> int:
-    """The sequence length the RoPE probe uses: real when small, capped at a saturated tile."""
+def _portable_rotary_probe(seq_len) -> tuple[int, str]:
+    """Portable RoPE fixes BLOCK_S; only ``seq_len``'s scalar specialization matters."""
     if seq_len is None or seq_len <= 0:
-        return 8
-    if seq_len <= 4096:
-        return seq_len
-    # The tile saturates well before 4096; keep the real 16-divisibility class.
-    return 4096 if seq_len % 16 == 0 else 4095
+        return 8, "seq=default"
+    if seq_len == 1:
+        return 1, "seq=one"
+    return (16, "seq=div16") if seq_len % 16 == 0 else (15, "seq=other")
 
 
-def probe_rotary_key(head_dim, seq_len, n_heads) -> str:
-    """The cache-key component for RoPE's head width, sequence tile, and head class."""
-    return f"h={head_dim}:seq={_probe_seq(seq_len)}:{probe_heads_key(n_heads)}"
+def _rotary_probe_shape(seq_len, head_dim, n_heads, device) -> tuple[int, str]:
+    """The probe sequence length and key component for this platform's RoPE variant.
+
+    A platform whose sequence tile is derived from ``seq_len`` may expose
+    ``probe_rotary_shape(seq_len, head_dim, n_heads, device)`` on its variant
+    module; the portable kernel keeps its fixed tile and only needs the scalar
+    specialization class.
+    """
+    from deepspeed.ops.triton_ops._triton import resolve_triton_ops_impl
+
+    hook = getattr(resolve_triton_ops_impl("fused_rotary_pos_emb"), "probe_rotary_shape", None)
+    if hook is not None:
+        return hook(seq_len, head_dim, n_heads, device)
+    return _portable_rotary_probe(seq_len)
+
+
+def probe_rotary_key(head_dim, seq_len, n_heads, device) -> str:
+    """The cache-key component for RoPE's head width, sequence variant, and head class."""
+    _, seq_key = _rotary_probe_shape(seq_len, head_dim, n_heads, device)
+    return f"h={head_dim}:{seq_key}:{probe_heads_key(n_heads)}"
 
 
 def _probe_tensor(size, dtype, device):
@@ -204,6 +222,7 @@ def swiglu_packed(dtype, device, inter=None, n_rows=None):
 
 
 def group_gemm(dtype, device):
+    """A support smoke test, not a warm-up: autotune's key is the real K/N/group count."""
     from deepspeed.ops.triton_ops.group_gemm_triton import _GroupGemmFn
 
     def forward():
@@ -231,10 +250,10 @@ def fused_rms_norm(dtype, device, n_cols=None, n_rows=None):
 def fused_rotary(dtype, device, head_dim=None, seq_len=None, n_heads=None):
     _FusedRotaryPosEmb = _dispatched_class("fused_rotary_pos_emb", "_FusedRotaryPosEmb")
     width = head_dim if head_dim is not None and head_dim > 0 else 64
-    # The NPU variant derives its sequence tile from the real sequence length;
-    # keep that value, but cap the allocation. 4096 already reaches the largest
-    # tile the UB budget selects on current devices.
-    seq = _probe_seq(seq_len)
+    # A platform with a shape-derived sequence tile picks a small representative
+    # sequence that selects the same tile as production; the portable kernel
+    # only needs the scalar specialization class.
+    seq, _ = _rotary_probe_shape(seq_len, width, n_heads, device)
     heads = _probe_heads(n_heads) or 4
 
     def forward():
@@ -291,7 +310,11 @@ def chunked_cross_entropy(dtype, device, vocab_size=None):
 
 
 def fp8_gemm(dtype, device, weight_dtype, k, n, quantization_group_size):
-    """FP8 GEMM has no autograd; the probe only runs the forward kernel."""
+    """FP8 GEMM has no autograd; the probe only runs the forward kernel.
+
+    The smoke shape uses M=16, so a production M >= 256 selects a different
+    BLOCK_M/BLOCK_N/BLOCK_K and compiles its own variant on first use.
+    """
     from deepspeed.ops.fp_quantizer.fp8_gemm_triton import matmul_fp8_triton
     from deepspeed.ops.triton_ops._triton import current_device
 
