@@ -217,9 +217,21 @@ def _swiglu_supported(gate: torch.Tensor) -> bool:
 
     The probe resolves the separate class through the same dispatch as the
     production path, so the gate answers for whichever implementation the
-    platform actually runs.
+    platform actually runs. The element count is part of the probe key because
+    platform variants derive their tile size from it.
     """
-    return is_triton_kernel_supported("swiglu", gate.dtype, gate.device, _probes.swiglu, gate.dtype, gate.device)
+    n_elements = gate.numel()
+    if n_elements == 0:
+        # The forward skips the kernel for empty inputs.
+        return True
+    return is_triton_kernel_supported("swiglu",
+                                      gate.dtype,
+                                      gate.device,
+                                      _probes.swiglu,
+                                      gate.dtype,
+                                      gate.device,
+                                      n_elements,
+                                      shape_key=_probes.probe_extent_key(n_elements))
 
 
 def _validate_packed_input(gate_up: torch.Tensor) -> None:
@@ -241,8 +253,21 @@ def _swiglu_packed_supported(gate_up: torch.Tensor) -> bool:
     production path, so the gate answers for whichever implementation the
     platform actually runs.
     """
-    return is_triton_kernel_supported("swiglu_packed", gate_up.dtype, gate_up.device, _probes.swiglu_packed,
-                                      gate_up.dtype, gate_up.device)
+    out_elements = gate_up.numel() // 2
+    if out_elements == 0:
+        # The forward skips the kernel for empty inputs.
+        return True
+    inter = gate_up.shape[-1] // 2
+    n_rows = gate_up.numel() // gate_up.shape[-1]
+    return is_triton_kernel_supported("swiglu_packed",
+                                      gate_up.dtype,
+                                      gate_up.device,
+                                      _probes.swiglu_packed,
+                                      gate_up.dtype,
+                                      gate_up.device,
+                                      inter,
+                                      n_rows,
+                                      shape_key=_probes.probe_packed_key(inter, n_rows))
 
 
 @dispatch("swiglu_triton")

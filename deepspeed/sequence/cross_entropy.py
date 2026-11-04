@@ -62,10 +62,15 @@ def _liger_can_run(vocab_parallel_logits, target, local_vocab_size, global_vocab
     from deepspeed.ops.triton_ops import _probes
     from deepspeed.ops.triton_ops._triton import is_triton_kernel_supported
 
-    return is_triton_kernel_supported("liger_vocab_parallel_cross_entropy", vocab_parallel_logits.dtype,
-                                      vocab_parallel_logits.device, _probes.liger_vocab_parallel_cross_entropy,
-                                      vocab_parallel_logits.dtype, vocab_parallel_logits.device, tp_group,
-                                      local_vocab_size)
+    return is_triton_kernel_supported("liger_vocab_parallel_cross_entropy",
+                                      vocab_parallel_logits.dtype,
+                                      vocab_parallel_logits.device,
+                                      _probes.liger_vocab_parallel_cross_entropy,
+                                      vocab_parallel_logits.dtype,
+                                      vocab_parallel_logits.device,
+                                      tp_group,
+                                      local_vocab_size,
+                                      shape_key=f"vocab={local_vocab_size}")
 
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):

@@ -259,20 +259,11 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     def communication_backend_name(self):
         return self._communication_backend_name
 
-    def is_triton_supported(self, kernel=None, probe=None):
+    def is_triton_supported(self):
         if not self.is_available():
             return False
         major, _ = torch.cuda.get_device_capability()
-        if major < 8:
-            return False
-        if probe is None:
-            return True
-        # Per-kernel decision by probe, shared with every backend that opens
-        # its Triton gate: run the kernel's minimal risky usage once per
-        # process and cache; no platform keeps a blacklist.
-        from deepspeed.ops.triton_ops._triton import probe_triton_kernel
-
-        return probe_triton_kernel(key=f"triton_kernel:{kernel}", run=probe)
+        return major >= 8
 
     def prefer_triton_grouped_mm(self):
         # torch._grouped_mm only has a fused grouped-GEMM kernel on Hopper (sm90)

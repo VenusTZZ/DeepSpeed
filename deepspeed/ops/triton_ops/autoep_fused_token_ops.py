@@ -229,7 +229,7 @@ def is_available() -> bool:
     return _TRITON_AVAILABLE and not _IS_ROCM_PYTORCH
 
 
-def assert_supported(rows: torch.Tensor, *, score_apply: str) -> None:
+def assert_supported(rows: torch.Tensor, *, score_apply: str, top_k: int | None = None) -> None:
     """Reject unsupported configurations before collectives begin."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError('combine_impl="fused_weighted_sum" needs Triton, which is not installed in this '
@@ -247,8 +247,16 @@ def assert_supported(rows: torch.Tensor, *, score_apply: str) -> None:
         raise RuntimeError('combine_impl="fused_weighted_sum" folds the routing weight into the top-k reduction, '
                            f'which only exists for score_apply="post", but this layer resolved '
                            f'score_apply="{score_apply}". Leave combine_impl unset.')
-    if not is_triton_kernel_supported("fused_weighted_restore", rows.dtype, rows.device,
-                                      _probes.fused_weighted_restore, rows.dtype, rows.device):
+    hidden = rows.shape[-1]
+    if not is_triton_kernel_supported("fused_weighted_restore",
+                                      rows.dtype,
+                                      rows.device,
+                                      _probes.fused_weighted_restore,
+                                      rows.dtype,
+                                      rows.device,
+                                      hidden,
+                                      top_k,
+                                      shape_key=f"h={hidden}:k={top_k}"):
         raise RuntimeError('combine_impl="fused_weighted_sum" failed this platform\'s runtime validation; '
                            "leave combine_impl unset to run the eager restore.")
 
@@ -384,8 +392,15 @@ def assert_row_weighting_supported(rows: torch.Tensor, weights: torch.Tensor) ->
     if not weights.is_contiguous():
         raise RuntimeError('row_weighting_impl="fused" requires contiguous weights. Set row_weighting_impl="eager" '
                            "for non-contiguous weight layouts.")
-    if not is_triton_kernel_supported("fused_row_weighting", rows.dtype, rows.device, _probes.fused_row_weighting,
-                                      rows.dtype, rows.device):
+    hidden = rows.shape[-1]
+    if not is_triton_kernel_supported("fused_row_weighting",
+                                      rows.dtype,
+                                      rows.device,
+                                      _probes.fused_row_weighting,
+                                      rows.dtype,
+                                      rows.device,
+                                      hidden,
+                                      shape_key=f"h={hidden}"):
         raise RuntimeError('row_weighting_impl="fused" failed this platform\'s runtime validation; '
                            'set row_weighting_impl="eager" to run the eager path.')
 

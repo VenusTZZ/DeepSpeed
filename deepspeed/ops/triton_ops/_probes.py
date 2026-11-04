@@ -37,6 +37,87 @@ def _dispatched_class(feature: str, class_name: str, portable_module: str | None
     return getattr(resolve_triton_ops_impl(feature, portable_module), class_name)
 
 
+# Elementwise kernels cap their tiles here. A probe that reaches this many
+# elements exercises the unmasked path and gives shape-derived variants the
+# same constexpr tile production uses; a smaller real workload keeps its own
+# extent so the compiled variant still matches.
+_PROBE_TILE = 2048
+
+
+def _probe_extent(n_elements, cap: int = _PROBE_TILE) -> int | None:
+    """A small element count with the same Triton specialization as ``n_elements``.
+
+    The count also stays in the same tile-size class: for a kernel whose tile is
+    derived from the element count, the probe compiles the variant production
+    will run. ``None`` means the caller passed no shape hint and the probe uses
+    its default toy shape.
+    """
+    if n_elements is None or n_elements <= 0:
+        return None
+    if n_elements == 1:
+        return 1
+    if n_elements < 16:
+        # Preserve the non-16-divisible specialization without becoming the
+        # constexpr-1 variant.
+        return n_elements
+    tile = min(cap, 1 << (n_elements - 1).bit_length())
+    return tile if n_elements % 16 == 0 else max(1, tile - 1)
+
+
+def _probe_rows(n_rows) -> int | None:
+    """A small row count with the same 16-divisibility specialization as ``n_rows``."""
+    if n_rows is None or n_rows <= 0:
+        return None
+    if n_rows == 1:
+        return 1
+    return 16 if n_rows % 16 == 0 else 15
+
+
+def _probe_heads(n_heads) -> int | None:
+    """A small head count in the same specialization class, kept cheap to allocate."""
+    if n_heads is None or n_heads <= 0:
+        return None
+    if n_heads == 1:
+        return 1
+    return 16 if n_heads % 16 == 0 else 2
+
+
+def probe_extent_key(n_elements) -> str:
+    """The cache-key component for a shape-derived elementwise tile."""
+    return f"n={_probe_extent(n_elements)}"
+
+
+def probe_rows_key(n_rows) -> str:
+    """The cache-key component for a shape-derived row count."""
+    return f"rows={_probe_rows(n_rows)}"
+
+
+def probe_heads_key(n_heads) -> str:
+    """The cache-key component for a shape-derived head count."""
+    return f"heads={_probe_heads(n_heads)}"
+
+
+def probe_packed_key(inter, n_rows) -> str:
+    """The cache-key component for the packed SwiGLU constexpr and output class."""
+    out_elements = max(1, int(n_rows)) * int(inter) if inter and n_rows else None
+    return f"inter={inter}:{probe_extent_key(out_elements)}"
+
+
+def _probe_seq(seq_len) -> int:
+    """The sequence length the RoPE probe uses: real when small, capped at a saturated tile."""
+    if seq_len is None or seq_len <= 0:
+        return 8
+    if seq_len <= 4096:
+        return seq_len
+    # The tile saturates well before 4096; keep the real 16-divisibility class.
+    return 4096 if seq_len % 16 == 0 else 4095
+
+
+def probe_rotary_key(head_dim, seq_len, n_heads) -> str:
+    """The cache-key component for RoPE's head width, sequence tile, and head class."""
+    return f"h={head_dim}:seq={_probe_seq(seq_len)}:{probe_heads_key(n_heads)}"
+
+
 def _probe_tensor(size, dtype, device):
     """A deterministic probe input in [0, 1) with no RNG involvement.
 
@@ -75,12 +156,14 @@ def _fwd_bwd(forward, device):
     return run
 
 
-def swiglu(dtype, device):
+def swiglu(dtype, device, n_elements=None):
     _SwiGLUFn = _dispatched_class("swiglu_triton", "_SwiGLUFn")
+    extent = _probe_extent(n_elements)
+    shape = (1, extent) if extent is not None else (32, 16)
 
     def forward():
-        gate = _probe_tensor((32, 16), dtype, device).requires_grad_()
-        up = _probe_tensor((32, 16), dtype, device).requires_grad_()
+        gate = _probe_tensor(shape, dtype, device).requires_grad_()
+        up = _probe_tensor(shape, dtype, device).requires_grad_()
         return _SwiGLUFn.apply(gate, up)
 
     return _fwd_bwd(forward, device)
@@ -91,11 +174,30 @@ def _swiglu_packed_fn():
     return _dispatched_class("swiglu_triton", "_SwiGLUPackedFn")
 
 
-def swiglu_packed(dtype, device):
+def _packed_probe_rows(n_rows, inter: int) -> int:
+    """Rows whose output keeps the real ``n_rows * inter`` specialization and tile."""
+    if inter <= 0:
+        return 1
+    out_elements = max(1, int(n_rows)) * int(inter) if n_rows else _PROBE_TILE
+    target = _probe_extent(out_elements) or _PROBE_TILE
+    if inter % 16 == 0:
+        # Every row count keeps the output in the divisible-by-16 class.
+        return max(1, (target + inter - 1) // inter)
+    rows = 16 if n_rows is None or n_rows % 16 == 0 else n_rows % 16
+    while rows * inter < target:
+        rows += 16
+    return max(1, rows)
+
+
+def swiglu_packed(dtype, device, inter=None, n_rows=None):
     _SwiGLUPackedFn = _swiglu_packed_fn()
+    if inter is None or inter <= 0:
+        shape = (32, 32)
+    else:
+        shape = (_packed_probe_rows(n_rows, inter), 2 * inter)
 
     def forward():
-        x = _probe_tensor((32, 32), dtype, device).requires_grad_()
+        x = _probe_tensor(shape, dtype, device).requires_grad_()
         return _SwiGLUPackedFn.apply(x)
 
     return _fwd_bwd(forward, device)
@@ -113,61 +215,75 @@ def group_gemm(dtype, device):
     return _fwd_bwd(forward, device)
 
 
-def fused_rms_norm(dtype, device):
+def fused_rms_norm(dtype, device, n_cols=None, n_rows=None):
     _FusedRMSNorm = _dispatched_class("fused_rms_norm", "_FusedRMSNorm")
+    width = n_cols if n_cols is not None and n_cols > 0 else 256
+    rows = _probe_rows(n_rows) or 2
 
     def forward():
-        hidden = _probe_tensor((2, 256), dtype, device).requires_grad_()
-        weight = _probe_tensor((256, ), dtype, device).requires_grad_()
+        hidden = _probe_tensor((rows, width), dtype, device).requires_grad_()
+        weight = _probe_tensor((width, ), dtype, device).requires_grad_()
         return _FusedRMSNorm.apply(hidden, weight, 1e-6)
 
     return _fwd_bwd(forward, device)
 
 
-def fused_rotary(dtype, device):
+def fused_rotary(dtype, device, head_dim=None, seq_len=None, n_heads=None):
     _FusedRotaryPosEmb = _dispatched_class("fused_rotary_pos_emb", "_FusedRotaryPosEmb")
+    width = head_dim if head_dim is not None and head_dim > 0 else 64
+    # The NPU variant derives its sequence tile from the real sequence length;
+    # keep that value, but cap the allocation. 4096 already reaches the largest
+    # tile the UB budget selects on current devices.
+    seq = _probe_seq(seq_len)
+    heads = _probe_heads(n_heads) or 4
 
     def forward():
-        q = _probe_tensor((1, 4, 8, 64), dtype, device).requires_grad_()
-        k = _probe_tensor((1, 4, 8, 64), dtype, device).requires_grad_()
-        cos = _probe_tensor((1, 8, 64), dtype, device)
-        sin = _probe_tensor((1, 8, 64), dtype, device)
+        q = _probe_tensor((1, heads, seq, width), dtype, device).requires_grad_()
+        k = _probe_tensor((1, heads, seq, width), dtype, device).requires_grad_()
+        cos = _probe_tensor((1, seq, width), dtype, device)
+        sin = _probe_tensor((1, seq, width), dtype, device)
         q_out, k_out = _FusedRotaryPosEmb.apply(q, k, cos, sin)
         return q_out + k_out
 
     return _fwd_bwd(forward, device)
 
 
-def fused_weighted_restore(dtype, device):
+def fused_weighted_restore(dtype, device, hidden=None, top_k=None):
     from deepspeed.ops.triton_ops.autoep_fused_token_ops import fused_weighted_restore
 
+    width = hidden if hidden is not None and hidden > 0 else 64
+    k = top_k if top_k is not None and top_k > 0 else 2
+
     def forward():
-        bsz, seqlen, hidden, top_k = 1, 2, 64, 2
-        combined_rows = _probe_tensor((bsz * seqlen * top_k, hidden), dtype, device).requires_grad_()
-        top_scores = _probe_tensor((bsz * seqlen, top_k), torch.float32, device).requires_grad_()
-        token_indices_sorted = torch.arange(bsz * seqlen * top_k, dtype=torch.int32, device=device)
-        return fused_weighted_restore(combined_rows, top_scores, token_indices_sorted, top_k, (bsz, seqlen, hidden))
+        bsz, seqlen = 1, 1
+        combined_rows = _probe_tensor((bsz * seqlen * k, width), dtype, device).requires_grad_()
+        top_scores = _probe_tensor((bsz * seqlen, k), torch.float32, device).requires_grad_()
+        token_indices_sorted = torch.arange(bsz * seqlen * k, dtype=torch.int32, device=device)
+        return fused_weighted_restore(combined_rows, top_scores, token_indices_sorted, k, (bsz, seqlen, width))
 
     return _fwd_bwd(forward, device)
 
 
-def fused_row_weighting(dtype, device):
+def fused_row_weighting(dtype, device, hidden=None):
     from deepspeed.ops.triton_ops.autoep_fused_token_ops import _FusedRowWeighting
 
+    width = hidden if hidden is not None and hidden > 0 else 64
+
     def forward():
-        rows = _probe_tensor((8, 64), dtype, device).requires_grad_()
-        weights = _probe_tensor((8, 1), torch.float32, device).requires_grad_()
+        rows = _probe_tensor((2, width), dtype, device).requires_grad_()
+        weights = _probe_tensor((2, 1), torch.float32, device).requires_grad_()
         return _FusedRowWeighting.apply(rows, weights)
 
     return _fwd_bwd(forward, device)
 
 
-def chunked_cross_entropy(dtype, device):
+def chunked_cross_entropy(dtype, device, vocab_size=None):
     _TritonCrossEntropy = _dispatched_class("chunked_cross_entropy", "_TritonCrossEntropy",
                                             "deepspeed.runtime.chunked_cross_entropy")
+    vocab = max(1, vocab_size) if vocab_size is not None and vocab_size > 0 else 64
 
     def forward():
-        logits = _probe_tensor((2, 64), dtype, device).requires_grad_()
+        logits = _probe_tensor((2, vocab), dtype, device).requires_grad_()
         target = torch.arange(2, dtype=torch.long, device=device)
         return _TritonCrossEntropy.apply(logits, target, -100)
 
