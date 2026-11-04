@@ -115,6 +115,12 @@ def is_triton_kernel_supported(kernel: str,
     ``probe_fn`` may be None for a static per-kernel declaration: nothing runs
     and the backend-level answer stands (used for probe-unsafe paths). Any probe
     exception answers False, which sends callers to their eager fallback.
+
+    A probe covers exactly the compiled variant named by ``shape_key``. Kernels
+    whose probe keeps a fixed smoke shape instead of the production one (grouped
+    GEMM, whose autotune key is the real K/N/group count, and FP8 GEMM, whose
+    block size depends on M) still compile their production variant on first real
+    use; their gates are support checks, not warm-ups.
     """
     probe_key = f"{kernel}:{device.type}:{device.index}:{dtype}"
     if shape_key:

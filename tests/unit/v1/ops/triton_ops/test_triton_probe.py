@@ -18,7 +18,8 @@ import torch
 
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, _TRITON_PROBE_CACHE, is_triton_kernel_supported
+from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, _TRITON_OPS_IMPL_CACHE, _TRITON_PROBE_CACHE,
+                                              is_triton_kernel_supported, resolve_triton_ops_impl)
 
 _ACCELERATOR = get_accelerator()
 
@@ -145,3 +146,107 @@ def test_static_declaration_answers_from_the_backend_gate_without_a_probe():
     # backend-level gate.
     _TRITON_PROBE_CACHE.pop(_key("unit_probe_static", dtype, device), None)
     assert is_triton_kernel_supported("unit_probe_static", dtype, device, None) == _ACCELERATOR.is_triton_supported()
+
+
+def _clear_kernel_caches(feature, portable_module=None):
+    """Forget in-process compiled variants so the probe has to compile them again."""
+    _TRITON_OPS_IMPL_CACHE.clear()
+    impl = resolve_triton_ops_impl(feature, portable_module)
+    for value in vars(impl).values():
+        if hasattr(value, "device_caches"):
+            value.device_caches.clear()
+
+
+def _record_compiles(monkeypatch):
+    from triton.runtime.jit import JITFunction
+
+    calls = []
+    original = JITFunction._do_compile
+
+    def wrapped(self, key, signature, device, constexprs, options, attrs, warmup):
+        calls.append(self._fn_name)
+        return original(self, key, signature, device, constexprs, options, attrs, warmup)
+
+    monkeypatch.setattr(JITFunction, "_do_compile", wrapped)
+    return calls
+
+
+def _assert_probe_compiles_the_production_variant(monkeypatch, kernel, probe_fn, probe_args, shape_key, real_call,
+                                                  feature, portable_module=None):
+    dtype, device = _dtype_and_device()
+    _clear_kernel_caches(feature, portable_module)
+    calls = _record_compiles(monkeypatch)
+    probe_key = f"triton_kernel:{kernel}:{device.type}:{device.index}:{dtype}:{shape_key}"
+    _TRITON_PROBE_CACHE.pop(probe_key, None)
+
+    assert is_triton_kernel_supported(kernel, dtype, device, probe_fn, *probe_args, shape_key=shape_key)
+    assert calls, "the probe did not compile anything; the test would not prove cache reuse"
+
+    calls.clear()
+    real_call()
+    _ACCELERATOR.current_stream().synchronize()
+    assert calls == [], f"the real call compiled again: {calls}"
+
+
+def test_shape_aware_probe_prevents_a_second_swiglu_compile(monkeypatch):
+    from deepspeed.ops.triton_ops.swiglu_triton import swiglu
+
+    dtype, device = _dtype_and_device()
+    gate = torch.randn(4, 64, dtype=dtype, device=device, requires_grad=True)
+    up = torch.randn(4, 64, dtype=dtype, device=device, requires_grad=True)
+    n_elements = gate.numel()
+
+    def real_call():
+        out = swiglu(gate, up)
+        out.sum().backward()
+
+    _assert_probe_compiles_the_production_variant(monkeypatch,
+                                                  "swiglu",
+                                                  _probes.swiglu, (dtype, device, n_elements),
+                                                  _probes.probe_extent_key(n_elements),
+                                                  real_call,
+                                                  "swiglu_triton")
+
+
+def test_shape_aware_probe_prevents_a_second_rms_norm_compile(monkeypatch):
+    from deepspeed.ops.triton_ops.fused_rms_norm import fused_rms_norm
+
+    dtype, device = _dtype_and_device()
+    hidden = torch.randn(2, 128, dtype=dtype, device=device, requires_grad=True)
+    weight = torch.randn(128, dtype=dtype, device=device, requires_grad=True)
+    n_rows, n_cols = hidden.shape
+
+    def real_call():
+        out = fused_rms_norm(hidden, weight, 1e-6)
+        out.sum().backward()
+
+    shape_key = f"{n_cols}:{_probes.probe_rows_key(n_rows)}"
+    _assert_probe_compiles_the_production_variant(monkeypatch,
+                                                  "fused_rms_norm",
+                                                  _probes.fused_rms_norm, (dtype, device, n_cols, n_rows),
+                                                  shape_key,
+                                                  real_call,
+                                                  "fused_rms_norm")
+
+
+def test_shape_aware_probe_prevents_a_second_rope_compile(monkeypatch):
+    from deepspeed.ops.triton_ops.fused_rotary_pos_emb import fused_apply_rotary_pos_emb
+
+    dtype, device = _dtype_and_device()
+    q = torch.randn(1, 8, 32, 64, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(1, 8, 32, 64, dtype=dtype, device=device, requires_grad=True)
+    cos = torch.randn(1, 32, 64, dtype=dtype, device=device)
+    sin = torch.randn(1, 32, 64, dtype=dtype, device=device)
+    head_dim, seq_len, n_heads = q.shape[-1], q.shape[2], q.shape[1]
+
+    def real_call():
+        q_out, k_out = fused_apply_rotary_pos_emb(q, k, cos, sin)
+        (q_out.sum() + k_out.sum()).backward()
+
+    shape_key = _probes.probe_rotary_key(head_dim, seq_len, n_heads, device)
+    _assert_probe_compiles_the_production_variant(monkeypatch,
+                                                  "fused_rotary_pos_emb",
+                                                  _probes.fused_rotary, (dtype, device, head_dim, seq_len, n_heads),
+                                                  shape_key,
+                                                  real_call,
+                                                  "fused_rotary_pos_emb")
