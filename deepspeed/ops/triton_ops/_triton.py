@@ -86,23 +86,39 @@ def probe_triton_kernel(key: str, run, reference=None, tolerance: float | None =
         return supported
 
 
-def is_triton_kernel_supported(kernel: str, dtype, device, probe_fn, *probe_args) -> bool:
-    """Ask the accelerator's Triton gate to validate ``kernel`` on this device and dtype.
+def is_triton_kernel_supported(kernel: str,
+                               dtype,
+                               device,
+                               probe_fn,
+                               *probe_args,
+                               shape_key: str | None = None) -> bool:
+    """Validate ``kernel`` on this device and dtype by running its probe once.
 
-    ``probe_fn(*probe_args)`` returns the kernel's minimal risky usage (see the
-    ``_probes`` library) and is only invoked when the answer is not yet cached, so
-    the probe runs at most once per kernel, device, and dtype per process and
-    every later call costs one dictionary lookup without even constructing the
-    probe. The dtype belongs to the key because a backend can compile a kernel
-    for one dtype and fail for another, so an answer for one dtype must not open
-    the gate for another. ``probe_fn`` may be None for a static per-kernel
-    declaration: nothing runs, and the accelerator answers for the kernel name
-    alone (used for probe-unsafe paths). No platform keeps a blacklist, and a
-    backend that gains or fixes support flips the gate automatically. Platforms
-    whose ``is_triton_supported`` predates the per-kernel extension keep their
-    static backend-level answer.
+    The probe runs in this shared layer rather than in each accelerator, so every
+    accelerator gets the same per-kernel answer without implementing or
+    maintaining a list of kernels: the backend answers only the coarse
+    "is Triton active here" question, and the probe lets each backend validate
+    the concrete kernel for itself. A backend that gains or fixes support flips
+    the gate automatically.
+
+    ``probe_fn(*probe_args)`` returns the kernel's riskiest representative use
+    (see the ``_probes`` library) and is only invoked when the answer is not yet
+    cached, so the probe runs at most once per process per kernel, device, dtype,
+    and compile-relevant shape signature. ``shape_key`` names the shape-derived
+    compile variant (tile size, constexpr dimensions, or scalar specialization
+    class). It belongs to the key because Triton keys its cache by those compile
+    inputs, not by the exact tensor shape: an answer for one variant must not
+    open the gate for another. Callers that omit it get the kernel/dtype/device
+    answer, which is correct only for kernels whose compiled variant does not
+    depend on shape.
+
+    ``probe_fn`` may be None for a static per-kernel declaration: nothing runs
+    and the backend-level answer stands (used for probe-unsafe paths). Any probe
+    exception answers False, which sends callers to their eager fallback.
     """
     probe_key = f"{kernel}:{device.type}:{device.index}:{dtype}"
+    if shape_key:
+        probe_key = f"{probe_key}:{shape_key}"
     key = f"triton_kernel:{probe_key}"
     if key in _TRITON_PROBE_CACHE:
         # Steady state: one dictionary lookup per call; no probe construction, no backend query.
@@ -121,20 +137,10 @@ def is_triton_kernel_supported(kernel: str, dtype, device, probe_fn, *probe_args
         # The backend-level gate cannot open mid-process; cache its answer too.
         _TRITON_PROBE_CACHE[key] = False
         return False
-    import inspect
-    extended = "probe" in inspect.signature(accelerator.is_triton_supported).parameters
     if probe_fn is None:
-        # A static per-kernel declaration with no probe: the accelerator
-        # answers for the kernel name alone and nothing runs. Used for
-        # probe-unsafe paths, whose answer must not depend on capture state.
-        # Platforms whose gate predates the extension keep their backend-level
-        # answer, already checked above.
-        supported = accelerator.is_triton_supported(kernel) if extended else True
-        _TRITON_PROBE_CACHE[key] = supported
-        return supported
-    if not extended:
-        # Platform whose gate predates the per-kernel extension: its static
-        # backend-level answer stands.
+        # A static per-kernel declaration with no probe: the backend-level
+        # answer stands and nothing runs. Used for probe-unsafe paths, whose
+        # answer must not depend on capture state.
         _TRITON_PROBE_CACHE[key] = True
         return True
     if accelerator.is_current_stream_capturing():
@@ -150,9 +156,7 @@ def is_triton_kernel_supported(kernel: str, dtype, device, probe_fn, *probe_args
         # rather than open the gate on a broken probe.
         _TRITON_PROBE_CACHE[key] = False
         return False
-    supported = accelerator.is_triton_supported(kernel=probe_key, probe=probe)
-    _TRITON_PROBE_CACHE[key] = supported
-    return supported
+    return probe_triton_kernel(key, probe)
 
 
 _TRITON_OPS_IMPL_CACHE: dict[str, object] = {}

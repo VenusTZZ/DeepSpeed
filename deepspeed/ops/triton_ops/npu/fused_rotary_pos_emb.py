@@ -16,7 +16,8 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, current_device, triton
-from deepspeed.ops.triton_ops.fused_rotary_pos_emb import assert_supported
+from deepspeed.ops.triton_ops.fused_rotary_pos_emb import (_platform_supported, _reference_apply_rotary_pos_emb,
+                                                           _validate_supported)
 
 if _TRITON_AVAILABLE:
     from deepspeed.ops.triton_ops.fused_rotary_pos_emb import _HEADS_PER_PROGRAM, _rotary_kernel, _unit_stride
@@ -126,5 +127,7 @@ def fused_apply_rotary_pos_emb(q: torch.Tensor,
                                sin: torch.Tensor,
                                unsqueeze_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """The portable fused RoPE with the Ascend sequence tile (see the module docstring)."""
-    assert_supported(q, k, cos, sin, unsqueeze_dim)
+    _validate_supported(q, k, cos, sin, unsqueeze_dim)
+    if not _TRITON_AVAILABLE or not _platform_supported(q, unsqueeze_dim):
+        return _reference_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     return _run_kernels(q, k, cos, sin, unsqueeze_dim)

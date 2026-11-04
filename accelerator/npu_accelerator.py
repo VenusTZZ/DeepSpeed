@@ -243,27 +243,17 @@ class NPU_Accelerator(DeepSpeedAccelerator):
     def communication_backend_name(self):
         return self._communication_backend_name
 
-    def is_triton_supported(self, kernel=None, probe=None):
+    def is_triton_supported(self):
         if not self.is_available():
             return False
         # Triton kernels run on Ascend via the triton-ascend backend, which
         # reports itself through the same driver probe as CUDA/ROCm in
         # deepspeed.ops.triton_ops._triton. If the backend is not installed,
-        # the Triton gates stay closed.
+        # the Triton gates stay closed. Per-kernel validation lives in the
+        # shared gate so every accelerator gets it without its own code.
         from deepspeed.ops.triton_ops import is_triton_available
 
-        if not is_triton_available():
-            return False
-        if probe is None:
-            # Backend-level gate: the backend is installed and active.
-            return True
-        # Per-kernel decision without any blacklist: run the kernel's minimal
-        # risky usage once per process on this device and cache the answer.
-        # The hardware answers for itself - a backend fix flips this gate
-        # automatically, and a new platform decides for itself the same way.
-        from deepspeed.ops.triton_ops._triton import probe_triton_kernel
-
-        return probe_triton_kernel(key=f"triton_kernel:{kernel}", run=probe)
+        return is_triton_available()
 
     def triton_ops_dir(self):
         return "deepspeed.ops.triton_ops.npu"

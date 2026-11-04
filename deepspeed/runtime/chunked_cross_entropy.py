@@ -75,8 +75,15 @@ def triton_backend_available() -> bool:
 
 def _triton_ce_gated(logits: torch.Tensor) -> bool:
     """The current backend validates the CE kernels for itself once per process."""
-    return is_triton_kernel_supported("chunked_cross_entropy", logits.dtype, logits.device,
-                                      _probes.chunked_cross_entropy, logits.dtype, logits.device)
+    vocab_size = logits.shape[-1]
+    return is_triton_kernel_supported("chunked_cross_entropy",
+                                      logits.dtype,
+                                      logits.device,
+                                      _probes.chunked_cross_entropy,
+                                      logits.dtype,
+                                      logits.device,
+                                      vocab_size,
+                                      shape_key=f"vocab={vocab_size}")
 
 
 def _resolve_backend(backend: str, logits: torch.Tensor) -> str:

@@ -18,7 +18,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, current_device, triton, tl
-from deepspeed.ops.triton_ops.fused_rms_norm import assert_supported
+from deepspeed.ops.triton_ops.fused_rms_norm import _platform_supported, _rms_norm_eager, _validate_supported
 
 if _TRITON_AVAILABLE:
     from deepspeed.ops.triton_ops.fused_rms_norm import (_DWEIGHT_BLOCK_M, _DWEIGHT_BLOCK_N,
@@ -233,5 +233,7 @@ def _run_kernels(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
 
 def fused_rms_norm(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """The portable fused RMSNorm with the Ascend launch shape (see the module docstring)."""
-    assert_supported(hidden, weight, eps)
+    _validate_supported(hidden, weight, eps)
+    if not _TRITON_AVAILABLE or not _platform_supported(hidden):
+        return _rms_norm_eager(hidden, weight, eps)
     return _run_kernels(hidden, weight, eps)
