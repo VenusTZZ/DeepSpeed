@@ -263,10 +263,7 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         if not self.is_available():
             return False
         major, _ = torch.cuda.get_device_capability()
-        if major >= 8:
-            return True
-        else:
-            return False
+        return major >= 8
 
     def prefer_triton_grouped_mm(self):
         # torch._grouped_mm only has a fused grouped-GEMM kernel on Hopper (sm90)

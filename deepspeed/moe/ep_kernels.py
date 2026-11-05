@@ -24,7 +24,7 @@ from typing import Callable
 
 import torch
 
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, triton, tl
+from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, is_accelerator_tensor, triton, tl
 
 logger = logging.getLogger(__name__)
 
@@ -387,8 +387,19 @@ def unpermute_rows(rows: torch.Tensor, permuted_indices: torch.Tensor, num_rows:
 
 
 def permute_rows_supported(rows: torch.Tensor) -> bool:
-    """Whether :func:`permute_rows` and :func:`unpermute_rows` can take ``rows``: 2-D, on CUDA, with Triton."""
-    return _TRITON_AVAILABLE and rows.device.type == "cuda" and rows.dim() == 2
+    """Whether :func:`permute_rows` and :func:`unpermute_rows` can take ``rows``.
+
+    The Triton gather path goes through the per-kernel Triton gate as a static
+    declaration: no probe runs (the path is probe-unsafe), so the backend-level
+    answer stands. A backend with a known problem in this specific path can keep
+    the eager fallback.
+    """
+    if not _TRITON_AVAILABLE or rows.dim() != 2 or not is_accelerator_tensor(rows):
+        return False
+
+    from deepspeed.ops.triton_ops._triton import is_triton_kernel_supported  # cold path; keeps the module import-light
+
+    return is_triton_kernel_supported("permute_rows_gather", rows.dtype, rows.device, None)
 
 
 # ===================================================================
