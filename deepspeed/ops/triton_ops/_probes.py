@@ -24,6 +24,21 @@ reproducible run over run.
 import torch
 
 
+def _dispatched_class(feature: str, class_name: str, portable_module: str | None = None):
+    """The kernel class the production path runs, through the per-hardware dispatch.
+
+    A probe must exercise the class production actually runs - the gate
+    protects that implementation - so the class resolves through the dispatch
+    exactly like the dispatched public function does (the probe must not call
+    the public function itself: that function checks the gate, and a probe
+    running inside the gate would deadlock on the probe lock). Platforms
+    without a variant get the portable class.
+    """
+    from deepspeed.ops.triton_ops._triton import resolve_triton_ops_impl
+
+    return getattr(resolve_triton_ops_impl(feature, portable_module), class_name)
+
+
 # Elementwise kernels cap their tiles here. A probe that reaches this many
 # elements exercises the unmasked path and gives shape-derived variants the
 # same constexpr tile production uses; a smaller real workload keeps its own
@@ -99,9 +114,25 @@ def _portable_rotary_probe(seq_len) -> tuple[int, str]:
     return (16, "seq=div16") if seq_len % 16 == 0 else (15, "seq=other")
 
 
+def _rotary_probe_shape(seq_len, head_dim, n_heads, device) -> tuple[int, str]:
+    """The probe sequence length and key component for this platform's RoPE variant.
+
+    A platform whose sequence tile is derived from ``seq_len`` may expose
+    ``probe_rotary_shape(seq_len, head_dim, n_heads, device)`` on its variant
+    module; the portable kernel keeps its fixed tile and only needs the scalar
+    specialization class.
+    """
+    from deepspeed.ops.triton_ops._triton import resolve_triton_ops_impl
+
+    hook = getattr(resolve_triton_ops_impl("fused_rotary_pos_emb"), "probe_rotary_shape", None)
+    if hook is not None:
+        return hook(seq_len, head_dim, n_heads, device)
+    return _portable_rotary_probe(seq_len)
+
+
 def probe_rotary_key(head_dim, seq_len, n_heads, device) -> str:
     """The cache-key component for RoPE's head width, sequence variant, and head class."""
-    _, seq_key = _portable_rotary_probe(seq_len)
+    _, seq_key = _rotary_probe_shape(seq_len, head_dim, n_heads, device)
     return f"h={head_dim}:{seq_key}:{probe_heads_key(n_heads)}"
 
 
@@ -144,7 +175,7 @@ def _fwd_bwd(forward, device):
 
 
 def swiglu(dtype, device, n_elements=None):
-    from deepspeed.ops.triton_ops.swiglu_triton import _SwiGLUFn
+    _SwiGLUFn = _dispatched_class("swiglu_triton", "_SwiGLUFn")
     extent = _probe_extent(n_elements)
     shape = (1, extent) if extent is not None else (32, 16)
 
@@ -154,6 +185,11 @@ def swiglu(dtype, device, n_elements=None):
         return _SwiGLUFn.apply(gate, up)
 
     return _fwd_bwd(forward, device)
+
+
+def _swiglu_packed_fn():
+    """The packed SwiGLU class through the per-hardware dispatch (see ``_dispatched_class``)."""
+    return _dispatched_class("swiglu_triton", "_SwiGLUPackedFn")
 
 
 def _packed_probe_rows(n_rows, inter: int) -> int:
@@ -172,7 +208,7 @@ def _packed_probe_rows(n_rows, inter: int) -> int:
 
 
 def swiglu_packed(dtype, device, inter=None, n_rows=None):
-    from deepspeed.ops.triton_ops.swiglu_triton import _SwiGLUPackedFn
+    _SwiGLUPackedFn = _swiglu_packed_fn()
     if inter is None or inter <= 0:
         shape = (32, 32)
     else:
@@ -199,7 +235,7 @@ def group_gemm(dtype, device):
 
 
 def fused_rms_norm(dtype, device, n_cols=None, n_rows=None):
-    from deepspeed.ops.triton_ops.fused_rms_norm import _FusedRMSNorm
+    _FusedRMSNorm = _dispatched_class("fused_rms_norm", "_FusedRMSNorm")
     width = n_cols if n_cols is not None and n_cols > 0 else 256
     rows = _probe_rows(n_rows) or 2
 
@@ -212,11 +248,12 @@ def fused_rms_norm(dtype, device, n_cols=None, n_rows=None):
 
 
 def fused_rotary(dtype, device, head_dim=None, seq_len=None, n_heads=None):
-    from deepspeed.ops.triton_ops.fused_rotary_pos_emb import _FusedRotaryPosEmb
+    _FusedRotaryPosEmb = _dispatched_class("fused_rotary_pos_emb", "_FusedRotaryPosEmb")
     width = head_dim if head_dim is not None and head_dim > 0 else 64
-    # The portable kernel fixes its sequence tile; only the scalar
-    # specialization class matters.
-    seq, _ = _portable_rotary_probe(seq_len)
+    # A platform with a shape-derived sequence tile picks a small representative
+    # sequence that selects the same tile as production; the portable kernel
+    # only needs the scalar specialization class.
+    seq, _ = _rotary_probe_shape(seq_len, width, n_heads, device)
     heads = _probe_heads(n_heads) or 4
 
     def forward():
@@ -260,7 +297,8 @@ def fused_row_weighting(dtype, device, hidden=None):
 
 
 def chunked_cross_entropy(dtype, device, vocab_size=None):
-    from deepspeed.runtime.chunked_cross_entropy import _TritonCrossEntropy
+    _TritonCrossEntropy = _dispatched_class("chunked_cross_entropy", "_TritonCrossEntropy",
+                                            "deepspeed.runtime.chunked_cross_entropy")
     vocab = max(1, vocab_size) if vocab_size is not None and vocab_size > 0 else 64
 
     def forward():

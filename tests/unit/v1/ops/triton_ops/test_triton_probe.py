@@ -18,7 +18,8 @@ import torch
 
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, _TRITON_PROBE_CACHE, is_triton_kernel_supported
+from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, _TRITON_OPS_IMPL_CACHE, _TRITON_PROBE_CACHE,
+                                              is_triton_kernel_supported, resolve_triton_ops_impl)
 
 _ACCELERATOR = get_accelerator()
 
@@ -150,9 +151,8 @@ def test_static_declaration_answers_from_the_backend_gate_without_a_probe():
 
 def _clear_kernel_caches(feature, portable_module=None):
     """Forget in-process compiled variants so the probe has to compile them again."""
-    import importlib
-
-    impl = importlib.import_module(portable_module or f"deepspeed.ops.triton_ops.{feature}")
+    _TRITON_OPS_IMPL_CACHE.clear()
+    impl = resolve_triton_ops_impl(feature, portable_module)
     for value in vars(impl).values():
         if hasattr(value, "device_caches"):
             value.device_caches.clear()
