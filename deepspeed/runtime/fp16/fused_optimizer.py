@@ -12,7 +12,8 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from deepspeed.runtime.base_optimizer import DeepSpeedOptimizer
 from deepspeed.runtime.utils import (CheckOverflow, get_flattened_grad_norm, get_global_norm, get_norm_with_moe_layers,
                                      get_weight_norm, is_invalid_grad_norm, is_model_parallel_parameter,
-                                     is_optimized_parameter)
+                                     is_optimized_parameter, get_replicated_tp_ranges,
+                                     get_flattened_replicated_tp_ranges, set_replicated_tp_flat_ranges)
 from deepspeed.runtime.fp16.loss_scaler import LossScaleConfig, LossScaleProfile
 from deepspeed.utils import logger
 from deepspeed.utils.torch import required_torch_version
@@ -169,10 +170,10 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         grads_groups_flat = []
         norm_groups = []
         for i, group in enumerate(self.fp16_groups):
-            grads_groups_flat.append(
-                _flatten_dense_tensors([
-                    torch.zeros(p.size(), dtype=p.dtype, device=p.device) if p.grad is None else p.grad for p in group
-                ]))
+            grad_flat = _flatten_dense_tensors(
+                [torch.zeros(p.size(), dtype=p.dtype, device=p.device) if p.grad is None else p.grad for p in group])
+            set_replicated_tp_flat_ranges(grad_flat, get_flattened_replicated_tp_ranges(group))
+            grads_groups_flat.append(grad_flat)
             norm_groups.append(get_weight_norm(grads_groups_flat[i], mpu=self.mpu))
 
         self.overflow = self.overflow_checker.check_using_norm(norm_groups)
@@ -240,15 +241,24 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         group_mask_idx_list = []
         grad_flat_st_idx = 0
         grad_flat_en_idx = 0
+        tensor_mp_rank = bwc_tensor_model_parallel_rank(self.mpu)
+
+        def add_mask_range(start, end):
+            if start >= end:
+                return
+            if group_mask_idx_list and start == group_mask_idx_list[-1][-1]:
+                group_mask_idx_list[-1][-1] = end
+            else:
+                group_mask_idx_list.append([start, end])
 
         for p in group:
             grad_flat_en_idx = grad_flat_st_idx + p.numel()
-            if p.grad is not None and self._require_avoid_recompute_norm(p, bwc_tensor_model_parallel_rank(self.mpu)):
-                # merge range
-                if len(group_mask_idx_list) > 0 and grad_flat_st_idx == group_mask_idx_list[-1][-1]:
-                    group_mask_idx_list[-1][-1] = grad_flat_en_idx
-                else:
-                    group_mask_idx_list.append([grad_flat_st_idx, grad_flat_en_idx])
+            if p.grad is not None:
+                if self._require_avoid_recompute_norm(p, tensor_mp_rank):
+                    add_mask_range(grad_flat_st_idx, grad_flat_en_idx)
+                elif tensor_mp_rank > 0 and is_model_parallel_parameter(p):
+                    for start, end in get_replicated_tp_ranges(p):
+                        add_mask_range(grad_flat_st_idx + start, grad_flat_st_idx + end)
             grad_flat_st_idx = grad_flat_en_idx
 
         return torch.tensor(group_mask_idx_list, device=get_accelerator().current_device_name())

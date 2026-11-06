@@ -1545,12 +1545,17 @@ class fused_LinearLayer(SubParamColumnParallel):
         kv_start = get_shard_size_list(n_embd, self.tp_world_size, self.tp_meta)[self.tp_index]
         group = self.mp_group
 
+        from deepspeed.runtime.utils import mark_replicated_tp_rows
         from deepspeed.utils.torch import register_grad_hook
 
-        # Route through ZeRO's post-accumulate helper; torch_npu skipped the plain hook
-        # under ZeRO 1/2, while CUDA ran it in our tests.
+        # The K/V rows are whole on every rank, so norm computation must count them once.
         for param in (self.weight, self.bias):
-            if param is not None and param.requires_grad:
+            if param is None:
+                continue
+            mark_replicated_tp_rows(param, kv_start, param.shape[0])
+            # Route through ZeRO's post-accumulate helper; torch_npu skipped the plain hook
+            # under ZeRO 1/2, while CUDA ran it in our tests.
+            if param.requires_grad:
                 register_grad_hook(param, _make_replicated_kv_grad_hook(param, kv_start, group))
 
     def _freeze_partition_sizes(self, total_size):

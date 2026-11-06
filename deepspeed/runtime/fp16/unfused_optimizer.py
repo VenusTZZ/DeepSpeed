@@ -13,7 +13,8 @@ from torch._utils import _flatten_dense_tensors
 
 from deepspeed.runtime.base_optimizer import DeepSpeedOptimizer
 from deepspeed.runtime.utils import (CheckOverflow, get_global_norm, get_weight_norm, is_invalid_grad_norm,
-                                     is_optimized_parameter)
+                                     is_optimized_parameter, get_flattened_replicated_tp_ranges,
+                                     set_replicated_tp_flat_ranges)
 from deepspeed.runtime.fp16.loss_scaler import LossScaleConfig, LossScaleProfile
 from deepspeed.utils import logger
 from deepspeed.utils.torch import required_torch_version
@@ -150,11 +151,16 @@ class FP16_UnfusedOptimizer(DeepSpeedOptimizer):
             grads_for_norm, expert_grads_for_norm = split_params_grads_into_shared_and_expert_params(group)
             norm_group_value = 0.0
             if len(grads_for_norm) > 0:
-                norm_group_value = get_weight_norm(_flatten_dense_tensors(grads_for_norm), mpu=self.mpu)
+                norm_grads = _flatten_dense_tensors(grads_for_norm)
+                set_replicated_tp_flat_ranges(norm_grads, get_flattened_replicated_tp_ranges(grads_for_norm))
+                norm_group_value = get_weight_norm(norm_grads, mpu=self.mpu)
             norm_groups.append(norm_group_value)
             expert_norm_group_value = 0.0
             if len(expert_grads_for_norm) > 0:
-                expert_norm_group_value = get_weight_norm(_flatten_dense_tensors(expert_grads_for_norm), mpu=self.mpu)
+                expert_norm_grads = _flatten_dense_tensors(expert_grads_for_norm)
+                set_replicated_tp_flat_ranges(expert_norm_grads,
+                                              get_flattened_replicated_tp_ranges(expert_grads_for_norm))
+                expert_norm_group_value = get_weight_norm(expert_norm_grads, mpu=self.mpu)
             expert_norm_groups.append(expert_norm_group_value)
 
         self.overflow = self.overflow_checker.check_using_norm(norm_groups + expert_norm_groups)

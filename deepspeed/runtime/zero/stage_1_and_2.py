@@ -25,7 +25,7 @@ from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dt
 from deepspeed.runtime.utils import (empty_cache, see_memory_usage, has_inf_or_nan, inf, is_model_parallel_parameter,
                                      align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace,
                                      combine_grad_norm_groups, count_used_parameters_in_backward, is_invalid_grad_norm,
-                                     is_optimized_parameter)
+                                     is_optimized_parameter, get_replicated_tp_ranges, norm_with_replicated_tp)
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.utils import ZeRORuntimeException, get_norm_dtype
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
@@ -1884,7 +1884,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         start = source_offset
         accumulated_grad = accumulated_grad.view(-1).narrow(0, start, num_elements)
 
-        self.norm_for_param_grads[param_id] = accumulated_grad.data.to(get_norm_dtype()).norm(2)
+        param_norm = accumulated_grad.data.to(get_norm_dtype()).norm(2)
+        if is_model_parallel_parameter(param) and self.model_parallel_rank != 0:
+            param_norm = norm_with_replicated_tp(accumulated_grad,
+                                                 2.0,
+                                                 self.model_parallel_rank,
+                                                 get_replicated_tp_ranges(param),
+                                                 offset=start)
+        self.norm_for_param_grads[param_id] = param_norm
 
     def set_norm_for_param_grad_in_gpu(self, param):
         param_id = self.get_param_id(param)
@@ -1899,7 +1906,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         start = source_offset
         accumulated_grad = accumulated_grad.view(-1).narrow(0, start, num_elements)
 
-        self.norm_for_param_grads[param_id] = accumulated_grad.data.to(get_norm_dtype()).norm(2)
+        param_norm = accumulated_grad.data.to(get_norm_dtype()).norm(2)
+        if is_model_parallel_parameter(param) and self.model_parallel_rank != 0:
+            param_norm = norm_with_replicated_tp(accumulated_grad,
+                                                 2.0,
+                                                 self.model_parallel_rank,
+                                                 get_replicated_tp_ranges(param),
+                                                 offset=start)
+        self.norm_for_param_grads[param_id] = param_norm
 
     def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
         param_id = self.get_param_id(param)
@@ -2669,7 +2683,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if pg_utils.is_parallel(self.model_parallel_group):
             dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
-    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+    def get_grad_norm_direct(self, gradients, params, norm_type=2, param_group_idx=None):
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -2699,14 +2713,27 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # if dist.get_rank() == 0:
             #    logger.info(f"Total Norm beginning {total_norm}")
             param_gradients = (g for g in gradients if not getattr(g, "_zero_padding", False))
+            partition_id = None
+            if param_group_idx is not None:
+                partition_id = dist.get_rank(group=self.real_dp_process_group[param_group_idx])
             for g, p in zip(param_gradients, params):
                 # Pipeline parallelism may replicate parameters. Avoid multi-counting.
                 if hasattr(p, PIPE_REPLICATED) and p.ds_pipe_replicated:
                     continue
                 if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
-                    all_norms.append(
-                        torch.linalg.vector_norm(g.data.to(get_norm_dtype()).detach(),
-                                                 ord=norm_type).to(get_accelerator().current_device_name()))
+                    param_norm = torch.linalg.vector_norm(g.data.to(get_norm_dtype()).detach(),
+                                                          ord=norm_type).to(get_accelerator().current_device_name())
+                    if is_model_parallel_parameter(p) and self.model_parallel_rank != 0:
+                        offset = 0
+                        if partition_id is not None:
+                            param_id = self.get_param_id(p)
+                            offset = self.grad_start_offset[param_group_idx][partition_id].get(param_id, 0)
+                        param_norm = norm_with_replicated_tp(g.data,
+                                                             norm_type,
+                                                             self.model_parallel_rank,
+                                                             get_replicated_tp_ranges(p),
+                                                             offset=offset).to(get_accelerator().current_device_name())
+                    all_norms.append(param_norm)
             if len(all_norms) > 0:
                 # vector_norm above already gives each ||g||_norm_type, and the 1/norm_type
                 # root is taken below, so the exponent here has to be norm_type too.
@@ -2972,7 +2999,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 norm = self.complete_grad_norm_calculation_for_cpu_offload(self.params_in_partition[i])
                 norm_groups.append(norm)
             else:
-                norm = self.get_grad_norm_direct(self.averaged_gradients[i], self.params_in_partition[i])
+                norm = self.get_grad_norm_direct(self.averaged_gradients[i],
+                                                 self.params_in_partition[i],
+                                                 param_group_idx=i)
                 if self._muon_update_lacks_loss_scale(i):
                     # Leave the -1 an invalid norm is masked to as it is.
                     norm = torch.where(norm >= 0, norm * self.loss_scale, norm)

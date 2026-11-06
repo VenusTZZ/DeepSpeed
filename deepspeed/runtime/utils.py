@@ -148,6 +148,81 @@ def is_model_parallel_parameter(p) -> bool:
     return False
 
 
+DS_REPLICATED_TP_ROWS = '_ds_replicated_tp_rows'
+DS_REPLICATED_TP_RANGES = '_ds_replicated_tp_ranges'
+
+
+def mark_replicated_tp_rows(param, start_row, end_row):
+    """Mark a contiguous row range that every tensor-parallel rank holds whole."""
+    if start_row < end_row:
+        setattr(param, DS_REPLICATED_TP_ROWS, (int(start_row), int(end_row)))
+
+
+def set_replicated_tp_flat_ranges(tensor, ranges):
+    """Mark already-flattened replicated ranges, for packed optimizer groups."""
+    ranges = tuple((int(start), int(end)) for start, end in ranges if start < end)
+    if ranges:
+        setattr(tensor, DS_REPLICATED_TP_RANGES, ranges)
+
+
+def get_replicated_tp_ranges(tensor):
+    """Return flattened replicated [start, end) ranges for a parameter or packed tensor."""
+    ranges = getattr(tensor, DS_REPLICATED_TP_RANGES, None)
+    if ranges is not None:
+        return ranges
+
+    rows = getattr(tensor, DS_REPLICATED_TP_ROWS, None)
+    if rows is None:
+        return ()
+    # ZeRO-3 replaces partitioned data with an empty view and keeps the original shape in
+    # ds_shape/ds_numel, so derive the row width from those when the live tensor is empty.
+    numel = tensor.numel()
+    shape = tuple(tensor.shape)
+    if numel == 0:
+        numel = getattr(tensor, 'ds_numel', 0)
+        shape = getattr(tensor, 'ds_shape', shape)
+    if numel == 0 or len(shape) == 0 or shape[0] == 0:
+        return ()
+    start, end = rows
+    row_width = numel // shape[0]
+    return ((start * row_width, end * row_width), )
+
+
+def get_flattened_replicated_tp_ranges(params):
+    """Concatenate the replicated ranges of ``params`` into one flat index space."""
+    ranges = []
+    offset = 0
+    for param in params:
+        ranges.extend((offset + start, offset + end) for start, end in get_replicated_tp_ranges(param))
+        offset += param.numel()
+    return tuple(ranges)
+
+
+def norm_with_replicated_tp(tensor, norm_type, tp_rank, ranges=None, offset=0):
+    """p-norm of ``tensor`` with replicated ranges excluded on TP ranks other than 0.
+
+    ``tensor`` is a view of the parameter starting at flat element ``offset``. Replicated rows
+    are counted only on rank 0, so the tensor-parallel all-reduce counts them once.
+    """
+    norm = tensor.detach().float().norm(norm_type)
+    if norm_type == inf or tp_rank == 0:
+        return norm
+    if ranges is None:
+        ranges = get_replicated_tp_ranges(tensor)
+    if not ranges:
+        return norm
+
+    flat = tensor.detach().reshape(-1)
+    end = offset + flat.numel()
+    replicated_power = torch.zeros((), dtype=torch.float32, device=flat.device)
+    for start, stop in ranges:
+        start = max(int(start), int(offset))
+        stop = min(int(stop), int(end))
+        if start < stop:
+            replicated_power += flat[start - offset:stop - offset].float().norm(norm_type)**norm_type
+    return (norm**norm_type - replicated_power).clamp_min(0).pow(1. / norm_type)
+
+
 def copy_to_device(item, device, criterion_func):
     """
     Return a copy of tensor on specified device.
@@ -457,10 +532,15 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
     else:
         total_norm = 0
+        tp_rank = mpu.get_model_parallel_rank() if mpu is not None else 0
         for p in norm_parameters:
             if mpu is not None:
-                if (mpu.get_model_parallel_rank() == 0) or is_model_parallel_parameter(p):
-                    param_norm = p.grad.data.detach().float().norm(norm_type)
+                if (tp_rank == 0) or is_model_parallel_parameter(p):
+                    if is_model_parallel_parameter(p):
+                        param_norm = norm_with_replicated_tp(p.grad.data, norm_type, tp_rank,
+                                                             get_replicated_tp_ranges(p))
+                    else:
+                        param_norm = p.grad.data.detach().float().norm(norm_type)
                     all_norms.append(param_norm)
             else:
                 param_norm = p.grad.data.detach().float().norm(norm_type)
@@ -655,7 +735,7 @@ def get_weight_norm(parameters, norm_type=2, mpu=None):
             if (tensor_mp_rank > 0) and not is_model_parallel_parameter(p):
                 continue
 
-            param_norm = p.data.float().norm(norm_type)
+            param_norm = norm_with_replicated_tp(p.data, norm_type, tensor_mp_rank, get_replicated_tp_ranges(p))
             total_norm += param_norm**norm_type
 
         # Sum across all model parallel GPUs.
@@ -986,7 +1066,7 @@ def combine_grad_norm_groups(norm_groups, norm_type=2):
     return torch.where(invalid, torch.full_like(combined, float("inf")), combined)
 
 
-def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, moe_ep_group=None):
+def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, moe_ep_group=None, replicated_ranges=None):
     """Get norm of an iterable of tensors.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -996,6 +1076,8 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, moe_ep_grou
         input_tensors (Iterable[Tensor]): an iterable of Tensors will have norm computed
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        replicated_ranges (Iterable[Iterable[Tuple[int, int]]]): optional flattened
+            replicated [start, end) ranges for each tensor.
 
     Returns:
         Total norm of the tensors (viewed as a single vector), as a detached float32 scalar tensor.
@@ -1026,8 +1108,10 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, moe_ep_grou
     else:
 
         device = get_accelerator().current_device_name()
-        for tensor in input_tensors:
-            tensor_norm = tensor.detach().float().norm(norm_type)
+        tp_rank = bwc_tensor_model_parallel_rank(mpu) if mpu is not None else 0
+        for idx, tensor in enumerate(input_tensors):
+            ranges = replicated_ranges[idx] if replicated_ranges is not None else None
+            tensor_norm = norm_with_replicated_tp(tensor, norm_type, tp_rank, ranges)
             all_norms.append(tensor_norm.to(device))
         norm_powers = torch.stack(all_norms).pow(norm_type)
         device_total_norm = norm_powers.sum()

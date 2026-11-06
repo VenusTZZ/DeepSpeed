@@ -15,7 +15,7 @@ from deepspeed.git_version_info import version
 from deepspeed.runtime.utils import (get_global_norm_of_tensors, clip_tensors_by_global_norm, DummyOptim,
                                      align_dense_tensors, all_gather_dp_groups, is_model_parallel_parameter,
                                      see_memory_usage, get_norm_with_moe_layers, is_invalid_grad_norm,
-                                     is_optimized_parameter)
+                                     is_optimized_parameter, get_replicated_tp_ranges, set_replicated_tp_flat_ranges)
 from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state, fragment_address, groups
 from deepspeed.moe.utils import is_moe_param, is_moe_param_group
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
@@ -575,16 +575,20 @@ class BF16_Optimizer(ZeROOptimizer):
 
                 if not self.fp32_groups_has_gradients[i][j]:
                     continue
+                grad_tensor = self.fp32_groups_gradients[i][j]
+                ranges = get_replicated_tp_ranges(lp)
+                if ranges:
+                    set_replicated_tp_flat_ranges(grad_tensor, ranges)
                 if not for_clipping:
                     param_group = self.optimizer.param_groups[i]
                     if self.has_moe_layers and is_moe_param_group(param_group):
                         if param_group['name'] not in expert_grads_for_norm:
                             expert_grads_for_norm[param_group['name']] = []
-                        expert_grads_for_norm[param_group['name']].append(self.fp32_groups_gradients[i][j])
+                        expert_grads_for_norm[param_group['name']].append(grad_tensor)
                     else:
-                        non_expert_grads_for_norm.append(self.fp32_groups_gradients[i][j])
+                        non_expert_grads_for_norm.append(grad_tensor)
                 else:
-                    all_grads_for_clip.append(self.fp32_groups_gradients[i][j])
+                    all_grads_for_clip.append(grad_tensor)
         if not for_clipping:
             return non_expert_grads_for_norm, expert_grads_for_norm
         return all_grads_for_clip

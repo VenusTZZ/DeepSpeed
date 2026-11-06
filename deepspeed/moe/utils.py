@@ -60,12 +60,23 @@ def split_params_grads_into_shared_and_expert_params(
     expert_grads: List[torch.Tensor] = []
     shared_grads: List[torch.Tensor] = []
 
+    def grad_with_ranges(param):
+        grad = param.grad.to(param.dtype)
+        # Keep replicated TP slices with the copied gradient so packed norm paths can
+        # count them once.
+        from deepspeed.runtime.utils import get_replicated_tp_ranges, set_replicated_tp_flat_ranges
+        ranges = get_replicated_tp_ranges(param)
+        if ranges:
+            grad.tensor_model_parallel = True
+            set_replicated_tp_flat_ranges(grad, ranges)
+        return grad
+
     for p in group:
         if p.grad is not None:
             if is_moe_param(p):
-                expert_grads.append(p.grad.to(p.dtype))
+                expert_grads.append(grad_with_ranges(p))
             else:
-                shared_grads.append(p.grad.to(p.dtype))
+                shared_grads.append(grad_with_ranges(p))
     return shared_grads, expert_grads
 
 
