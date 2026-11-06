@@ -1886,11 +1886,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         param_norm = accumulated_grad.data.to(get_norm_dtype()).norm(2)
         if is_model_parallel_parameter(param) and self.model_parallel_rank != 0:
-            param_norm = norm_with_replicated_tp(accumulated_grad,
-                                                 2.0,
-                                                 self.model_parallel_rank,
-                                                 get_replicated_tp_ranges(param),
-                                                 offset=start)
+            ranges = get_replicated_tp_ranges(param)
+            if ranges:
+                param_norm = norm_with_replicated_tp(accumulated_grad, 2.0, self.model_parallel_rank, ranges,
+                                                     offset=start)
         self.norm_for_param_grads[param_id] = param_norm
 
     def set_norm_for_param_grad_in_gpu(self, param):
@@ -1908,11 +1907,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         param_norm = accumulated_grad.data.to(get_norm_dtype()).norm(2)
         if is_model_parallel_parameter(param) and self.model_parallel_rank != 0:
-            param_norm = norm_with_replicated_tp(accumulated_grad,
-                                                 2.0,
-                                                 self.model_parallel_rank,
-                                                 get_replicated_tp_ranges(param),
-                                                 offset=start)
+            ranges = get_replicated_tp_ranges(param)
+            if ranges:
+                param_norm = norm_with_replicated_tp(accumulated_grad, 2.0, self.model_parallel_rank, ranges,
+                                                     offset=start)
         self.norm_for_param_grads[param_id] = param_norm
 
     def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
@@ -2724,15 +2722,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     param_norm = torch.linalg.vector_norm(g.data.to(get_norm_dtype()).detach(),
                                                           ord=norm_type).to(get_accelerator().current_device_name())
                     if is_model_parallel_parameter(p) and self.model_parallel_rank != 0:
-                        offset = 0
-                        if partition_id is not None:
-                            param_id = self.get_param_id(p)
-                            offset = self.grad_start_offset[param_group_idx][partition_id].get(param_id, 0)
-                        param_norm = norm_with_replicated_tp(g.data,
-                                                             norm_type,
-                                                             self.model_parallel_rank,
-                                                             get_replicated_tp_ranges(p),
-                                                             offset=offset).to(get_accelerator().current_device_name())
+                        ranges = get_replicated_tp_ranges(p)
+                        if ranges:
+                            offset = 0
+                            if partition_id is not None:
+                                param_id = self.get_param_id(p)
+                                offset = self.grad_start_offset[param_group_idx][partition_id].get(param_id, 0)
+                            param_norm = norm_with_replicated_tp(g.data,
+                                                                 norm_type,
+                                                                 self.model_parallel_rank,
+                                                                 ranges,
+                                                                 offset=offset).to(
+                                                                     get_accelerator().current_device_name())
                     all_norms.append(param_norm)
             if len(all_norms) > 0:
                 # vector_norm above already gives each ||g||_norm_type, and the 1/norm_type

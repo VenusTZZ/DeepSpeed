@@ -1454,11 +1454,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         param_norm = self._constant_buffered_norm2(grad)
         if (not self._grad_norm_counts_every_rank([param], self._get_param_partition_group(param))
                 and is_model_parallel_parameter(param) and self.model_parallel_rank != 0):
-            param_norm = norm_with_replicated_tp(grad,
-                                                 2.0,
-                                                 self.model_parallel_rank,
-                                                 get_replicated_tp_ranges(param),
-                                                 offset=offset)
+            ranges = get_replicated_tp_ranges(param)
+            if ranges:
+                param_norm = norm_with_replicated_tp(grad, 2.0, self.model_parallel_rank, ranges, offset=offset)
         return param_norm
 
     def _offload_grad_partition_at_boundary(self, param, grad_buffer, offload_fp32_gradients, offload_fp32_offsets):
@@ -2483,13 +2481,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     param_norm = g.to(get_accelerator().device_name(),
                                       non_blocking=True).to(get_norm_dtype()).norm(norm_type)
                     if (not counts_every_rank and is_model_parallel_parameter(p) and self.model_parallel_rank != 0):
-                        partition_size = p.ds_tensor.ds_numel if p.ds_tensor is not None else p.ds_numel
-                        offset = partition_size * self._get_param_partition_rank(p)
-                        param_norm = norm_with_replicated_tp(g,
-                                                             norm_type,
-                                                             self.model_parallel_rank,
-                                                             get_replicated_tp_ranges(p),
-                                                             offset=offset).to(param_norm.device)
+                        ranges = get_replicated_tp_ranges(p)
+                        if ranges:
+                            partition_size = p.ds_tensor.ds_numel if p.ds_tensor is not None else p.ds_numel
+                            offset = partition_size * self._get_param_partition_rank(p)
+                            param_norm = norm_with_replicated_tp(g, norm_type, self.model_parallel_rank, ranges,
+                                                                 offset=offset).to(param_norm.device)
                     grad_norms.append(param_norm)
 
             # Sum across all model parallel GPUs.

@@ -536,10 +536,12 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
         for p in norm_parameters:
             if mpu is not None:
                 if (tp_rank == 0) or is_model_parallel_parameter(p):
+                    param_norm = None
                     if is_model_parallel_parameter(p):
-                        param_norm = norm_with_replicated_tp(p.grad.data, norm_type, tp_rank,
-                                                             get_replicated_tp_ranges(p))
-                    else:
+                        ranges = get_replicated_tp_ranges(p)
+                        if ranges:
+                            param_norm = norm_with_replicated_tp(p.grad.data, norm_type, tp_rank, ranges)
+                    if param_norm is None:
                         param_norm = p.grad.data.detach().float().norm(norm_type)
                     all_norms.append(param_norm)
             else:
@@ -735,7 +737,11 @@ def get_weight_norm(parameters, norm_type=2, mpu=None):
             if (tensor_mp_rank > 0) and not is_model_parallel_parameter(p):
                 continue
 
-            param_norm = norm_with_replicated_tp(p.data, norm_type, tensor_mp_rank, get_replicated_tp_ranges(p))
+            ranges = get_replicated_tp_ranges(p)
+            if ranges:
+                param_norm = norm_with_replicated_tp(p.data, norm_type, tensor_mp_rank, ranges)
+            else:
+                param_norm = p.data.float().norm(norm_type)
             total_norm += param_norm**norm_type
 
         # Sum across all model parallel GPUs.
@@ -1111,7 +1117,12 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, moe_ep_grou
         tp_rank = bwc_tensor_model_parallel_rank(mpu) if mpu is not None else 0
         for idx, tensor in enumerate(input_tensors):
             ranges = replicated_ranges[idx] if replicated_ranges is not None else None
-            tensor_norm = norm_with_replicated_tp(tensor, norm_type, tp_rank, ranges)
+            if ranges is None:
+                ranges = get_replicated_tp_ranges(tensor)
+            if ranges:
+                tensor_norm = norm_with_replicated_tp(tensor, norm_type, tp_rank, ranges)
+            else:
+                tensor_norm = tensor.detach().float().norm(norm_type)
             all_norms.append(tensor_norm.to(device))
         norm_powers = torch.stack(all_norms).pow(norm_type)
         device_total_norm = norm_powers.sum()
