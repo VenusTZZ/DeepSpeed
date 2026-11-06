@@ -1358,10 +1358,14 @@ class TestGPTBigCodeMultiQueryTraining(DistributedTest):
     def test_matches_single_device_training_tp2(self, zero_stage):
         self._train_and_compare(2, zero_stage)
 
+    @pytest.mark.parametrize("zero_stage", [0, 1, 2, 3])
+    def test_clipping_matches_single_device_training_tp2(self, zero_stage):
+        self._train_and_compare(2, zero_stage, clip_grad=1.0)
+
     def test_matches_single_device_training_tp4(self):
         self._train_and_compare(4, 0)
 
-    def _train_and_compare(self, expected_tp, zero_stage):
+    def _train_and_compare(self, expected_tp, zero_stage, clip_grad=0.0):
         skip_on_device()
         assert dist.get_world_size() == 4, (f"this case expects four ranks, got {dist.get_world_size()}")
         transformers = pytest.importorskip("transformers")
@@ -1399,6 +1403,8 @@ class TestGPTBigCodeMultiQueryTraining(DistributedTest):
             if zero_stage == 0 and reference_kv_grads is None:
                 c_attn = reference.transformer.h[0].attn.c_attn
                 reference_kv_grads = (c_attn.weight.grad[hidden:].clone(), c_attn.bias.grad[hidden:].clone())
+            if clip_grad > 0.0:
+                torch.nn.utils.clip_grad_norm_(reference.parameters(), clip_grad)
             reference_optimizer.step()
             reference_optimizer.zero_grad()
             reference_losses.append(loss.item())
@@ -1411,8 +1417,8 @@ class TestGPTBigCodeMultiQueryTraining(DistributedTest):
                     "lr": lr,
                 },
             },
-            # The reference does not clip, and DeepSpeed clips to norm 1.0 by default.
-            "gradient_clipping": 0.0,
+            # The reference clips identically when clip_grad is enabled.
+            "gradient_clipping": clip_grad,
             "zero_allow_untested_optimizer": True,
             "tensor_parallel": {
                 "autotp_size": expected_tp,

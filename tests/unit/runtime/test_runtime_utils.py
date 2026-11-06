@@ -30,6 +30,20 @@ def test_call_to_str():
     assert c2s('hello', 1138, val=3) == 'hello(1138, val=3)'
 
 
+def test_replicated_tp_norm_counts_rows_once():
+    grad = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    ranges = ((2, 4), )
+    assert ds_utils.norm_with_replicated_tp(grad, 2.0, 0, ranges).item() == pytest.approx(30**0.5)
+    assert ds_utils.norm_with_replicated_tp(grad, 2.0, 1, ranges).item() == pytest.approx(5**0.5)
+
+    # A local partition may start partway through the replicated range.
+    partition = grad[3:]
+    assert ds_utils.norm_with_replicated_tp(partition, 2.0, 1, ranges, offset=3).item() == 0.0
+
+    # The inf-norm is unchanged: duplicate copies do not change the max.
+    assert ds_utils.norm_with_replicated_tp(grad, torch.inf, 1, ranges).item() == 4.0
+
+
 class TestClipGradNorm(DistributedTest):
     world_size = 2
 
