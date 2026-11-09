@@ -20,11 +20,23 @@ fallback - are imported from the portable module, so the variants only fork
 what actually differs.
 """
 
+import os
+
 import torch
 
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, current_device, triton
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, current_device, probe_error, probe_once, triton)
 from deepspeed.ops.triton_ops.swiglu_triton import (_swiglu_eager, _swiglu_packed_eager, _swiglu_packed_supported,
                                                     _swiglu_supported, _validate_packed_input)
+from deepspeed.utils import logger
+
+# The platform owner chooses how a failed probe behaves. "fallback" keeps the
+# eager path and warns once; "raise" surfaces the failure so a regression
+# cannot hide behind a slower path.
+_PACKED_PROBE_POLICY = os.environ.get("DS_NPU_TRITON_PROBE_POLICY", "fallback")
+if _PACKED_PROBE_POLICY not in ("fallback", "raise"):
+    raise ValueError("DS_NPU_TRITON_PROBE_POLICY must be 'fallback' or 'raise', "
+                     f"got {_PACKED_PROBE_POLICY!r}")
 
 if _TRITON_AVAILABLE:
     from deepspeed.ops.triton_ops.npu._ub import compute_activation_block_size
@@ -116,6 +128,45 @@ if _TRITON_AVAILABLE:
 
             return grad_gate_up
 
+    def _packed_swiglu_probe_key(gate_up):
+        return f"npu:swiglu_packed:1elem:{gate_up.device}:{gate_up.dtype}"
+
+    def _packed_swiglu_probe(gate_up):
+        """Platform-owned support probe for the one-output-element form.
+
+        The packed backward has had a backend compile issue on the smallest
+        form; probe it once per device and dtype before the real call. This is
+        the Ascend counterpart of the old global pre-test: the probe and the
+        failure policy live in this variant, not at every call site.
+        """
+        if get_accelerator().is_current_stream_capturing():
+            # Launching a probe during capture would break the capture; defer
+            # it to the first non-capturing call and do not cache this answer.
+            return True
+
+        key = _packed_swiglu_probe_key(gate_up)
+
+        def run():
+            x = torch.arange(2, dtype=torch.float32, device=gate_up.device).div_(2).to(gate_up.dtype).reshape(1, 2)
+            x.requires_grad_(True)
+            with torch.enable_grad():
+                out = _SwiGLUPackedFn.apply(x)
+                out.sum().backward()
+            get_accelerator().current_stream().synchronize()
+
+        return probe_once(key, run)
+
+    def _packed_swiglu_probe_failed(gate_up):
+        key = _packed_swiglu_probe_key(gate_up)
+        error = probe_error(key)
+        if _PACKED_PROBE_POLICY == "raise":
+            raise RuntimeError("NPU Triton swiglu_packed probe failed on this device/dtype; "
+                               "set DS_NPU_TRITON_PROBE_POLICY=fallback to use the eager path.") from error
+        logger.warning_once(f"NPU Triton swiglu_packed probe failed for {gate_up.device}/{gate_up.dtype}; "
+                            f"using the eager fallback. Set DS_NPU_TRITON_PROBE_POLICY=raise to fail loudly. "
+                            f"Cause: {error}")
+        return _swiglu_packed_eager(gate_up)
+
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """The separate SwiGLU with the Ascend UB-budgeted tiles (see the module docstring)."""
@@ -136,4 +187,9 @@ def swiglu_packed(gate_up: torch.Tensor) -> torch.Tensor:
     _validate_packed_input(gate_up)
     if not _TRITON_AVAILABLE or not _swiglu_packed_supported(gate_up):
         return _swiglu_packed_eager(gate_up)
+    # The one-output-element form is the known backend compile risk; probe it
+    # once and apply this platform's failure policy. Larger shapes run
+    # directly and are covered by the kernel tests.
+    if gate_up.numel() == 2 and not _packed_swiglu_probe(gate_up):
+        return _packed_swiglu_probe_failed(gate_up)
     return _SwiGLUPackedFn.apply(gate_up)
