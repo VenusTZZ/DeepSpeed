@@ -69,11 +69,13 @@ def test_missing_feature_raises_after_the_platform_fallback(monkeypatch):
 def test_out_of_package_feature_without_a_platform_variant_resolves_its_portable_module(monkeypatch):
     # Triton kernels living outside triton_ops pass their portable module
     # explicitly; a feature the platform subpackage does not override keeps
-    # that portable module.
+    # that portable module. The liger CE kernel lives outside the package and
+    # has no Ascend variant.
     monkeypatch.setattr(deepspeed.accelerator, "get_accelerator",
                         lambda: _FakeAccelerator("deepspeed.ops.triton_ops.npu"))
-    impl = resolve_triton_ops_impl("fp8_gemm_triton", portable_module="deepspeed.ops.fp_quantizer.fp8_gemm_triton")
-    assert impl.__name__ == "deepspeed.ops.fp_quantizer.fp8_gemm_triton"
+    impl = resolve_triton_ops_impl("liger_vocab_parallel_cross_entropy",
+                                   portable_module="deepspeed.sequence.cross_entropy")
+    assert impl.__name__ == "deepspeed.sequence.cross_entropy"
 
 
 def test_out_of_package_feature_with_a_platform_variant_resolves_the_platform_module(monkeypatch):
