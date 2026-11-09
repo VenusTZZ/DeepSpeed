@@ -32,15 +32,17 @@ def _scale_per_element(scale: torch.Tensor, k: int, n: int, group_size: int) -> 
 
 
 def _decode_uint8_fp8(weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Decode the uint8 8-bit FP layout to ``dtype`` with the portable kernel's arithmetic."""
+    """Decode the uint8 8-bit FP layout to ``dtype`` with the portable kernel's arithmetic.
+
+    The 7-bit field is laid out as fp16, whose 4 low exponent bits and subnormals
+    line up with E4M3 (exponent field 0 is zero or subnormal); 2^(15 - 7) = 256
+    then restores the bias.
+    """
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(f"FP8 GEMM supports bfloat16 and float16 activations, got {dtype}.")
     bits = weight.to(torch.int32)
-    if dtype == torch.bfloat16:
-        value = ((bits & 0x80) << 8) | ((bits & 0x7F) << 4)
-        return (value + 0x3C00).to(torch.uint16).view(torch.bfloat16)
-    if dtype == torch.float16:
-        value = ((bits & 0x80) << 8) | ((bits & 0x7F) << 7)
-        return (value + 0x2000).to(torch.uint16).view(torch.float16)
-    raise RuntimeError(f"FP8 GEMM supports bfloat16 and float16 activations, got {dtype}.")
+    fp16_bits = ((bits & 0x80) << 8) | ((bits & 0x7F) << 7)
+    return (fp16_bits.to(torch.uint16).view(torch.float16).float() * 256.0).to(dtype)
 
 
 def matmul_fp8_triton(inp, weight, scale, quantization_group_size):
