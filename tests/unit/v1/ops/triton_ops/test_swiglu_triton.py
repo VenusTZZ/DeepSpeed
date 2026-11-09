@@ -29,7 +29,7 @@ import torch.nn.functional as F
 @pytest.fixture(autouse=True)
 def _load_swiglu_in_the_worker():
     global current_device, get_accelerator, swiglu, swiglu_packed, swiglu_clamped, swiglu_clamped_packed
-    # The shared Triton availability probe initializes its driver, so it must run after pytest forks its worker.
+    # The shared Triton availability check initializes its driver, so it must run after pytest forks its worker.
     from deepspeed.accelerator import get_accelerator
     from deepspeed.ops.triton_ops import is_triton_available
     from deepspeed.ops.triton_ops._triton import current_device

@@ -128,6 +128,6 @@ def fused_apply_rotary_pos_emb(q: torch.Tensor,
                                unsqueeze_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """The portable fused RoPE with the Ascend sequence tile (see the module docstring)."""
     _validate_supported(q, k, cos, sin, unsqueeze_dim)
-    if not _TRITON_AVAILABLE or not _platform_supported(q, unsqueeze_dim):
+    if not _TRITON_AVAILABLE or not _platform_supported(q):
         return _reference_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     return _run_kernels(q, k, cos, sin, unsqueeze_dim)

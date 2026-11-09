@@ -19,7 +19,7 @@ from deepspeed.accelerator import get_accelerator
 from unit.common import DistributedTest
 
 QWEN3_MOE_RMS_NORM = "transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm"
-# Keep parametrization collection-safe: importing the Triton ops here would probe CUDA before --forked.
+# Keep parametrization collection-safe: importing the Triton ops here would initialize the Triton driver before --forked.
 RMS_NORM_CLASSES = (
     "transformers.models.deepseek_v2.modeling_deepseek_v2.DeepseekV2RMSNorm",
     "transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm",

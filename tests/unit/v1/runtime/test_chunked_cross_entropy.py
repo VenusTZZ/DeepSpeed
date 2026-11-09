@@ -33,7 +33,7 @@ BACKEND_DEVICES = [
 def _load_loss_runtime_in_the_worker(request):
     global ChunkedCausalLMLoss, chunked_cross_entropy, install_chunked_causal_lm_loss, triton_backend_available
     global _TRITON_ON_ACCELERATOR
-    # The shared Triton helper probes its driver on import, so load it after pytest has forked its worker.
+    # The shared Triton helper initializes its driver on import, so load it after pytest has forked its worker.
     from deepspeed.runtime.chunked_cross_entropy import (ChunkedCausalLMLoss, chunked_cross_entropy,
                                                          install_chunked_causal_lm_loss, triton_backend_available)
     _TRITON_ON_ACCELERATOR = _ACCELERATOR_AVAILABLE and triton_backend_available()

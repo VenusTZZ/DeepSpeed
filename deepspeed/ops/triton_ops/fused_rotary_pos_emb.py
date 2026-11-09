@@ -163,8 +163,8 @@ def _validate_supported(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin
         raise RuntimeError("fused RoPE treats cos and sin as constants, but one of them requires grad.")
 
 
-def _platform_supported(q: torch.Tensor, unsqueeze_dim: int) -> bool:
-    """Whether this backend can run the fused RoPE kernels for the query's shape."""
+def _platform_supported(q: torch.Tensor) -> bool:
+    """Whether this backend can run the fused RoPE kernels for the query's device."""
     if not _TRITON_AVAILABLE or _IS_ROCM_PYTORCH:
         return False
     if q.numel() == 0:
@@ -181,7 +181,7 @@ def assert_supported(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: t
         raise RuntimeError("fused RoPE needs Triton, which is not installed in this environment.")
     if _IS_ROCM_PYTORCH:
         raise RuntimeError("fused RoPE is not yet supported on ROCm.")
-    if not _platform_supported(q, unsqueeze_dim):
+    if not _platform_supported(q):
         raise RuntimeError("fused RoPE's Triton kernels are not enabled by this platform's Triton gate; "
                            "run the eager function instead.")
 
@@ -288,7 +288,7 @@ def fused_apply_rotary_pos_emb(q: torch.Tensor,
     only: differentiating them again raises. Unsupported inputs raise.
     """
     _validate_supported(q, k, cos, sin, unsqueeze_dim)
-    if not _platform_supported(q, unsqueeze_dim):
+    if not _platform_supported(q):
         return _reference_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     return _run_kernels(q, k, cos, sin, unsqueeze_dim)
 
