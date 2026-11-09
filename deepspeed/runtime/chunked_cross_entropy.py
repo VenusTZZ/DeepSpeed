@@ -20,9 +20,8 @@ import operator
 
 import torch
 
-from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, dispatch, is_accelerator_tensor,
-                                              is_triton_kernel_supported, triton, tl)
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, dispatch, is_accelerator_tensor, triton, tl)
 from deepspeed.utils.torch import required_torch_version
 
 _IS_ROCM_PYTORCH = getattr(torch.version, "hip", None) is not None
@@ -70,20 +69,7 @@ if _TRITON_AVAILABLE:
 
 
 def triton_backend_available() -> bool:
-    return _TRITON_AVAILABLE and not _IS_ROCM_PYTORCH
-
-
-def _triton_ce_gated(logits: torch.Tensor) -> bool:
-    """The current backend validates the CE kernels for itself once per process."""
-    vocab_size = logits.shape[-1]
-    return is_triton_kernel_supported("chunked_cross_entropy",
-                                      logits.dtype,
-                                      logits.device,
-                                      _probes.chunked_cross_entropy,
-                                      logits.dtype,
-                                      logits.device,
-                                      vocab_size,
-                                      shape_key=f"vocab={vocab_size}")
+    return _TRITON_AVAILABLE and not _IS_ROCM_PYTORCH and get_accelerator().is_triton_supported()
 
 
 def _resolve_backend(backend: str, logits: torch.Tensor) -> str:
@@ -91,15 +77,10 @@ def _resolve_backend(backend: str, logits: torch.Tensor) -> str:
         raise ValueError(f"Unsupported chunked cross-entropy backend {backend!r}; expected one of {BACKENDS}")
     on_accelerator = is_accelerator_tensor(logits)
     if backend == "auto":
-        if on_accelerator and triton_backend_available() and _triton_ce_gated(logits):
-            return "triton"
-        return "torch"
+        return "triton" if on_accelerator and triton_backend_available() else "torch"
     if backend == "triton" and not (on_accelerator and triton_backend_available()):
         raise RuntimeError("The Triton chunked cross-entropy backend needs accelerator logits and Triton; use "
                            'backend="torch" to run elsewhere')
-    if backend == "triton" and not _triton_ce_gated(logits):
-        raise RuntimeError("The Triton chunked cross-entropy kernels failed this platform's runtime validation; use "
-                           'backend="torch".')
     return backend
 
 

@@ -12,9 +12,9 @@ import types
 import torch
 from torch.autograd.function import once_differentiable
 
-from deepspeed.ops.triton_ops import _probes
+from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, current_device, dispatch, is_accelerator_tensor,
-                                              is_triton_kernel_supported, triton, tl)
+                                              triton, tl)
 from deepspeed.utils import logger
 
 _IS_ROCM_PYTORCH = getattr(torch.version, "hip", None) is not None
@@ -170,19 +170,7 @@ def _platform_supported(q: torch.Tensor, unsqueeze_dim: int) -> bool:
     if q.numel() == 0:
         # The launch skips the kernels for empty inputs.
         return True
-    head_dim = q.shape[-1]
-    n_heads = q.shape[1] if unsqueeze_dim == 1 else q.shape[2]
-    seq_len = q.shape[2] if unsqueeze_dim == 1 else q.shape[1]
-    return is_triton_kernel_supported("fused_rotary_pos_emb",
-                                      q.dtype,
-                                      q.device,
-                                      _probes.fused_rotary,
-                                      q.dtype,
-                                      q.device,
-                                      head_dim,
-                                      seq_len,
-                                      n_heads,
-                                      shape_key=_probes.probe_rotary_key(head_dim, seq_len, n_heads, q.device))
+    return get_accelerator().is_triton_supported()
 
 
 def assert_supported(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -194,7 +182,7 @@ def assert_supported(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: t
     if _IS_ROCM_PYTORCH:
         raise RuntimeError("fused RoPE is not yet supported on ROCm.")
     if not _platform_supported(q, unsqueeze_dim):
-        raise RuntimeError("fused RoPE's Triton kernels failed this platform's runtime validation; "
+        raise RuntimeError("fused RoPE's Triton kernels are not enabled by this platform's Triton gate; "
                            "run the eager function instead.")
 
 

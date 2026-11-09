@@ -47,52 +47,6 @@ if _TRITON_AVAILABLE:
             min_block=1,
         )
 
-    def _seq_specialization(value: int) -> str:
-        if value == 1:
-            return "one"
-        return "div16" if value % 16 == 0 else "other"
-
-    def _first_with_class_at_least(start: int, spec: str) -> int:
-        if spec == "div16":
-            return ((start + 15) // 16) * 16
-        candidate = max(2, start)
-        return candidate + 1 if candidate % 16 == 0 else candidate
-
-    def _first_with_class_in_range(lo: int, hi: int, spec: str) -> int | None:
-        if spec == "div16":
-            candidate = ((lo + 15) // 16) * 16
-            return candidate if candidate <= hi else None
-        for candidate in range(lo, hi + 1):
-            if candidate != 1 and candidate % 16 != 0:
-                return candidate
-        return None
-
-    def probe_rotary_shape(seq_len, head_dim, n_heads, device):
-        """A small sequence selecting the same BLOCK_S and scalar class as production."""
-        if seq_len is None or seq_len <= 0:
-            return 8, "tile=default:cls=other"
-        width = head_dim if head_dim is not None and head_dim > 0 else 64
-        block_half = max(16, triton.next_power_of_2(width // 2))
-        target = _block_s(seq_len, block_half, device)
-        spec = _seq_specialization(seq_len)
-        if spec == "one":
-            return 1, f"tile={target}:cls=one"
-        fallback = 16 if block_half >= 128 else (32 if block_half >= 64 else 64)
-        count = multiprocessor_count(device) or 1
-        if target >= fallback:
-            # The tile is capped by the fallback: any class-matching sequence at
-            # or above count * fallback selects it.
-            candidate = _first_with_class_at_least(count * fallback, spec)
-        else:
-            # target is the next power of two above cdiv(seq_len, count); this is
-            # the sequence range that selects exactly that desired tile.
-            candidate = _first_with_class_in_range(count * (target // 2) + 1, count * target, spec)
-            if candidate is None:
-                candidate = seq_len
-        if candidate is None or _block_s(candidate, block_half, device) != target:
-            candidate = seq_len
-        return candidate, f"tile={target}:cls={spec}"
-
     def _launch(x, cos, sin, out, backward):
         batch, heads, seq_len, head_dim = x.shape
         if x.numel() == 0:

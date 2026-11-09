@@ -392,18 +392,17 @@ def unpermute_rows(rows: torch.Tensor, permuted_indices: torch.Tensor, num_rows:
 def permute_rows_supported(rows: torch.Tensor) -> bool:
     """Whether :func:`permute_rows` and :func:`unpermute_rows` can take ``rows``.
 
-    The Triton gather path goes through the per-kernel Triton gate as a static
-    declaration: no probe runs (the path is probe-unsafe), and the accelerator
-    answers for the kernel name alone. A backend with a known problem in this
-    specific path can keep the eager fallback or select its own implementation
-    through the triton_ops dispatch.
+    The Triton gather path is gated by the accelerator's Triton switch. A backend
+    with a known problem in this specific path can keep the eager fallback or
+    select its own implementation through the triton_ops dispatch.
     """
     if not _TRITON_AVAILABLE or rows.dim() != 2 or not is_accelerator_tensor(rows):
         return False
 
-    from deepspeed.ops.triton_ops._triton import is_triton_kernel_supported  # cold path; keeps the module import-light
+    # Cold path: keep the module import-light.
+    from deepspeed.accelerator import get_accelerator
 
-    return is_triton_kernel_supported("permute_rows_gather", rows.dtype, rows.device, None)
+    return get_accelerator().is_triton_supported()
 
 
 # ===================================================================

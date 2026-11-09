@@ -35,9 +35,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, current_device, dispatch, is_triton_kernel_supported,
-                                              triton, tl)
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, current_device, dispatch, triton, tl
 
 if _TRITON_AVAILABLE:
 
@@ -213,25 +212,11 @@ def _swiglu_eager(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def _swiglu_supported(gate: torch.Tensor) -> bool:
-    """The separate path's runtime gate, shared with platform variants.
-
-    The probe resolves the separate class through the same dispatch as the
-    production path, so the gate answers for whichever implementation the
-    platform actually runs. The element count is part of the probe key because
-    platform variants derive their tile size from it.
-    """
-    n_elements = gate.numel()
-    if n_elements == 0:
+    """The separate path's runtime gate, shared with platform variants."""
+    if gate.numel() == 0:
         # The forward skips the kernel for empty inputs.
         return True
-    return is_triton_kernel_supported("swiglu",
-                                      gate.dtype,
-                                      gate.device,
-                                      _probes.swiglu,
-                                      gate.dtype,
-                                      gate.device,
-                                      n_elements,
-                                      shape_key=_probes.probe_extent_key(n_elements))
+    return get_accelerator().is_triton_supported()
 
 
 def _validate_packed_input(gate_up: torch.Tensor) -> None:
@@ -247,27 +232,11 @@ def _swiglu_packed_eager(gate_up: torch.Tensor) -> torch.Tensor:
 
 
 def _swiglu_packed_supported(gate_up: torch.Tensor) -> bool:
-    """The packed path's runtime gate, shared with platform variants.
-
-    The probe resolves the packed class through the same dispatch as the
-    production path, so the gate answers for whichever implementation the
-    platform actually runs.
-    """
-    out_elements = gate_up.numel() // 2
-    if out_elements == 0:
+    """The packed path's runtime gate, shared with platform variants."""
+    if gate_up.numel() == 0:
         # The forward skips the kernel for empty inputs.
         return True
-    inter = gate_up.shape[-1] // 2
-    n_rows = gate_up.numel() // gate_up.shape[-1]
-    return is_triton_kernel_supported("swiglu_packed",
-                                      gate_up.dtype,
-                                      gate_up.device,
-                                      _probes.swiglu_packed,
-                                      gate_up.dtype,
-                                      gate_up.device,
-                                      inter,
-                                      n_rows,
-                                      shape_key=_probes.probe_packed_key(inter, n_rows))
+    return get_accelerator().is_triton_supported()
 
 
 @dispatch("swiglu_triton")
@@ -292,8 +261,7 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     if not _TRITON_AVAILABLE:
         return _swiglu_eager(gate, up)
 
-    # Runtime detection: the current backend validates the kernels for itself once per
-    # process; a platform that fails the probe runs eager for every later call.
+    # A platform whose accelerator Triton gate is closed runs eager.
     if not _swiglu_supported(gate):
         return _swiglu_eager(gate, up)
 

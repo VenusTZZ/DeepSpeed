@@ -40,8 +40,8 @@ from __future__ import annotations
 
 import torch
 
-from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, dispatch, is_triton_kernel_supported, triton, tl
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, dispatch, triton, tl
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -489,11 +489,10 @@ def group_gemm_triton(mat_a: torch.Tensor,
     # the contraction dim is checked without materializing a transpose view.
     _validate(mat_a, mat_b, offs, trans_b)
 
-    # Runtime detection: the current backend validates the grouped-GEMM kernels for
-    # itself once per process; a platform that fails the probe gets the native
-    # grouped GEMM (its semantics are the drop-in this module mirrors).
-    if not is_triton_kernel_supported("group_gemm", mat_a.dtype, mat_a.device, _probes.group_gemm, mat_a.dtype,
-                                      mat_a.device):
+    # The accelerator's Triton gate decides whether this platform runs the Triton
+    # kernels; platforms without it get the native grouped GEMM (its semantics are
+    # the drop-in this module mirrors).
+    if not get_accelerator().is_triton_supported():
         b_native = mat_b.transpose(-2, -1).contiguous() if trans_b else mat_b.contiguous()
         return torch._grouped_mm(mat_a.contiguous(), b_native, offs.to(torch.int32))
 

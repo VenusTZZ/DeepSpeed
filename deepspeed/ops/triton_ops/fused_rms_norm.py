@@ -7,9 +7,8 @@ from __future__ import annotations
 import torch
 from torch.autograd.function import once_differentiable
 
-from deepspeed.ops.triton_ops import _probes
-from deepspeed.ops.triton_ops._triton import (_TRITON_AVAILABLE, dispatch, is_accelerator_tensor,
-                                              is_triton_kernel_supported, triton, tl)
+from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, dispatch, is_accelerator_tensor, triton, tl
 from deepspeed.utils import logger
 
 _IS_ROCM_PYTORCH = getattr(torch.version, "hip", None) is not None
@@ -182,16 +181,7 @@ def _platform_supported(hidden: torch.Tensor) -> bool:
     if hidden.numel() == 0:
         # The forward skips the kernels for empty inputs.
         return True
-    n_rows, n_cols = hidden.reshape(-1, hidden.shape[-1]).shape
-    return is_triton_kernel_supported("fused_rms_norm",
-                                      hidden.dtype,
-                                      hidden.device,
-                                      _probes.fused_rms_norm,
-                                      hidden.dtype,
-                                      hidden.device,
-                                      n_cols,
-                                      n_rows,
-                                      shape_key=f"{n_cols}:{_probes.probe_rows_key(n_rows)}")
+    return get_accelerator().is_triton_supported()
 
 
 def assert_supported(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> None:
@@ -202,7 +192,7 @@ def assert_supported(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> 
     if _IS_ROCM_PYTORCH:
         raise RuntimeError("fused RMSNorm is not yet supported on ROCm.")
     if not _platform_supported(hidden):
-        raise RuntimeError("fused RMSNorm's Triton kernels failed this platform's runtime validation; "
+        raise RuntimeError("fused RMSNorm's Triton kernels are not enabled by this platform's Triton gate; "
                            "run the eager forward instead.")
 
 

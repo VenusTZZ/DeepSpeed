@@ -57,20 +57,7 @@ def _liger_can_run(vocab_parallel_logits, target, local_vocab_size, global_vocab
             and vocab_parallel_logits.dtype in (torch.float32, torch.float16, torch.bfloat16) and target.numel() > 0
             and local_vocab_size * tp_world_size == global_vocab_size):
         return False
-    # Runtime detection: Liger's kernels answer for themselves on first use, so a platform
-    # where they fail falls back to the PyTorch path without any maintained list.
-    from deepspeed.ops.triton_ops import _probes
-    from deepspeed.ops.triton_ops._triton import is_triton_kernel_supported
-
-    return is_triton_kernel_supported("liger_vocab_parallel_cross_entropy",
-                                      vocab_parallel_logits.dtype,
-                                      vocab_parallel_logits.device,
-                                      _probes.liger_vocab_parallel_cross_entropy,
-                                      vocab_parallel_logits.dtype,
-                                      vocab_parallel_logits.device,
-                                      tp_group,
-                                      local_vocab_size,
-                                      shape_key=f"vocab={local_vocab_size}")
+    return True
 
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):

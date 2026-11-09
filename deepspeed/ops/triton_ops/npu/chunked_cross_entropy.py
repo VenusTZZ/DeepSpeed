@@ -10,7 +10,7 @@ log-sum-exps and losses reduce host-side afterwards. This variant adopts that
 launch shape with the portable module's arithmetic and semantics: no label
 smoothing, no z-loss, ignored rows contribute zero loss and gradient. A
 vocabulary that fits one tile degenerates to the portable per-row math, so
-the small-shape contract (including the probe) is bitwise unchanged.
+the small-shape contract is bitwise unchanged.
 """
 
 import torch
