@@ -422,6 +422,9 @@ def execute_transfers(requests: Sequence[TransferRequest],
     rounds = max((len(value) for value in list(recv_rounds.values()) + list(send_rounds.values())), default=0)
     sent = received = copied = 0
     pending = []
+    # Every Work exposes block_current_stream(), but the base implementation is CUDA-only. Backends
+    # that do not override it fail at the first call, so probe once and keep to blocking waits.
+    block_stream_usable = stream_ordered
 
     for round_index in range(rounds):
         p2p = []
@@ -455,10 +458,21 @@ def execute_transfers(requests: Sequence[TransferRequest],
         if operations:
             for handle in dist.batch_isend_irecv(operations):
                 block_stream = getattr(handle, 'block_current_stream', None)
-                if stream_ordered and callable(block_stream):
-                    # Order arena reuse on the caller stream; transport errors surface at the bounded drain below.
-                    block_stream()
-                    pending.append(handle)
+                if block_stream_usable and callable(block_stream):
+                    try:
+                        # Order arena reuse on the caller stream; transport errors surface at the
+                        # bounded drain below.
+                        block_stream()
+                    except RuntimeError:
+                        # Base Work::blockCurrentStream() builds a CUDA StreamBlock and needs
+                        # getFuture(); fall back to waiting for this and every later handle.
+                        block_stream_usable = False
+                        for retained in pending:
+                            retained.wait()
+                        pending.clear()
+                        handle.wait()
+                    else:
+                        pending.append(handle)
                 else:
                     handle.wait()
         # Stream ordering already protects arena reuse. Bound retained handles while avoiding
