@@ -7,10 +7,12 @@
 import math
 import os
 from dataclasses import replace
+from unittest import mock
 
 import pytest
 import torch
 import deepspeed.comm as dist
+import deepspeed.checkpoint.affine_transfer_executor as executor
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine import contiguous_split_map, replicated_map
 from deepspeed.checkpoint.affine_transfer import PlanBudget, plan_transfer
@@ -88,6 +90,82 @@ class TestB2Transfer(DistributedTest):
         assert stats.chunks > 0
         assert sum(segment.numel for segment in plan.segments) == math.prod(target.logical_shape), \
             'the plan must cover the parameter exactly once'
+
+    def test_transport_without_stream_ordering_falls_back_to_wait(self):
+        _join_transfer_group()
+        source, target = _row_to_column(self.world_size)
+        dtype = torch.float32
+        full = _full(16, 16, dtype)
+        endpoints = TransferEndpoints(source={loc: loc
+                                              for loc in source.shard_shapes},
+                                      target={loc: loc
+                                              for loc in target.shard_shapes})
+        source_buffers = {
+            location: source.extract(full, location).contiguous()
+            for location, process in endpoints.source.items() if process == dist.get_rank()
+        }
+        target_buffers = _targets(target, endpoints, dtype)
+        plan = plan_transfer(target, source, PlanBudget())
+
+        calls = {'probe': 0, 'posted': 0, 'waited': 0}
+
+        class _UnorderedHandle:
+            """Exposes the base block_current_stream(), whose implementation is CUDA-only."""
+
+            def __init__(self, handle):
+                self._handle = handle
+
+            def block_current_stream(self):
+                calls['probe'] += 1
+                raise RuntimeError('Failed to create StreamBlock')
+
+            def wait(self, *args, **kwargs):
+                calls['waited'] += 1
+                return self._handle.wait(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        batch_isend_irecv = dist.batch_isend_irecv
+
+        def wrapped_batch(*args, **kwargs):
+            handles = batch_isend_irecv(*args, **kwargs)
+            calls['posted'] += len(handles)
+            return [_UnorderedHandle(handle) for handle in handles]
+
+        class _NoOpStream:
+            """The CPU accelerator has no stream; copies are already synchronous."""
+
+            def synchronize(self):
+                pass
+
+        class _AsyncDevice:
+            """Reports asynchronous execution so the executor probes stream ordering."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def is_synchronized_device(self):
+                return False
+
+            def current_stream(self, device_index=None):
+                stream = self._real.current_stream(device_index)
+                return stream if stream is not None else _NoOpStream()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_accelerator = get_accelerator()
+        with mock.patch.object(executor, 'get_accelerator', lambda: _AsyncDevice(real_accelerator)), \
+             mock.patch.object(dist, 'batch_isend_irecv', wrapped_batch):
+            stats = execute_transfer(plan, source_buffers, target_buffers, endpoints, dtype, StagingBudget(64))
+
+        _assert_matches(target_buffers, target, full)
+        # The first unusable probe disables stream ordering for the rest of the call, across rounds.
+        assert stats.rounds > 1
+        assert calls['posted'] >= stats.rounds
+        assert calls['probe'] == 1
+        assert calls['waited'] == calls['posted']
 
     @pytest.mark.parametrize('batched', [False, True])
     def test_scalar_plan_crosses_processes(self, batched):
