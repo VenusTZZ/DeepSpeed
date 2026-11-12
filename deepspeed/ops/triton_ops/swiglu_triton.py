@@ -29,8 +29,14 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, triton, tl
+
+# torch 2.14 changed clamp's boundary subgradient for scalar bounds: 2.13 and earlier
+# pass the gradient through at the limit, 2.14 and later zero it. The clamped SwiGLU
+# backward mirrors the eager expression, so it must follow the installed torch's convention.
+_CLAMP_BOUNDARY_IS_INCLUSIVE = Version(torch.__version__.split("+")[0]).release[:2] < (2, 14)
 
 if _TRITON_AVAILABLE:
 
@@ -291,8 +297,8 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _swiglu_clamped_bwd_kernel(grad_out_ptr, gate_ptr, up_ptr, grad_gate_ptr, grad_up_ptr, n_elements, alpha,
-                                   limit, OAI: tl.constexpr, PACKED: tl.constexpr, INTER: tl.constexpr,
-                                   BLOCK_SIZE: tl.constexpr):
+                                   limit, OAI: tl.constexpr, INCLUSIVE: tl.constexpr, PACKED: tl.constexpr,
+                                   INTER: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis=0).to(tl.int64)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
@@ -308,9 +314,14 @@ if _TRITON_AVAILABLE:
         up = tl.load(up_ptr + up_offsets, mask=mask).to(tl.float32)
         g = tl.minimum(gate, limit)
         u = tl.minimum(tl.maximum(up, -limit), limit)
-        # torch.clamp passes the gradient through where the input is inside the limits, inclusive.
-        pass_gate = gate <= limit
-        pass_up = (up >= -limit) & (up <= limit)
+        # Follow the installed torch's clamp boundary convention: torch <= 2.13 passes
+        # the gradient at the limit, torch >= 2.14 zeroes it.
+        if INCLUSIVE:
+            pass_gate = gate <= limit
+            pass_up = (up >= -limit) & (up <= limit)
+        else:
+            pass_gate = gate < limit
+            pass_up = (up > -limit) & (up < limit)
 
         if OAI:
             sig = tl.sigmoid(g * alpha)
@@ -373,6 +384,7 @@ if _TRITON_AVAILABLE:
                                                  ctx.alpha,
                                                  ctx.limit,
                                                  OAI=ctx.oai,
+                                                 INCLUSIVE=_CLAMP_BOUNDARY_IS_INCLUSIVE,
                                                  PACKED=False,
                                                  INTER=1,
                                                  BLOCK_SIZE=_BLOCK_SIZE,
@@ -428,6 +440,7 @@ if _TRITON_AVAILABLE:
                                                      ctx.alpha,
                                                      ctx.limit,
                                                      OAI=ctx.oai,
+                                                     INCLUSIVE=_CLAMP_BOUNDARY_IS_INCLUSIVE,
                                                      PACKED=True,
                                                      INTER=gate_up.shape[-1] // 2,
                                                      BLOCK_SIZE=_BLOCK_SIZE,

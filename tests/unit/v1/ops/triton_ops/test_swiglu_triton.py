@@ -310,8 +310,10 @@ def test_clamped_alpha_and_limit_are_honoured(oai):
     assert torch.all(gate.grad[gate.detach() > 2.0] == 0)
 
 
-def test_clamped_gradient_at_the_limit_is_inclusive():
-    # torch.clamp passes the gradient where input == limit; the kernel must agree
+def test_clamped_gradient_at_the_limit_matches_torch():
+    # torch.clamp's boundary convention is version-dependent: through 2.13 it passes
+    # the gradient at input == limit, from 2.14 it zeroes it. The kernel must follow
+    # whatever the installed torch does.
     dev = get_accelerator().current_device_name()
     gate = torch.full((8, 8), 7.0, device=dev, requires_grad=True)
     up = torch.full((8, 8), -7.0, device=dev, requires_grad=True)
@@ -321,7 +323,8 @@ def test_clamped_gradient_at_the_limit_is_inclusive():
     _clamped_eager(gate_ref, up_ref, 1.702, 7.0, True).sum().backward()
     torch.testing.assert_close(gate.grad, gate_ref.grad)
     torch.testing.assert_close(up.grad, up_ref.grad)
-    assert torch.all(gate.grad != 0) and torch.all(up.grad != 0)
+    assert torch.equal(gate.grad != 0, gate_ref.grad != 0)
+    assert torch.equal(up.grad != 0, up_ref.grad != 0)
 
 
 def test_clamped_empty_input():
