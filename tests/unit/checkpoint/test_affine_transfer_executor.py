@@ -459,7 +459,8 @@ class TestB2LazyViewsRefused(DistributedTest):
             execute_transfer(plan_transfer(map_, map_), {rank: self._lazy(base, kind)}, {rank: base}, endpoints,
                              base.dtype)
         assert 'conjugate or negative view' in str(refused.value.__cause__)
-        assert torch.equal(base, before)
+        # NPU's complex64 equal/any are not implemented; compare the small values on the host.
+        assert torch.equal(base.cpu(), before.cpu())
 
     @pytest.mark.parametrize('kind', ['conj', 'neg'])
     @pytest.mark.parametrize('side', ['source', 'target'])
@@ -478,7 +479,7 @@ class TestB2LazyViewsRefused(DistributedTest):
             execute_transfer(plan_transfer(map_, map_), sources, targets, endpoints, values.dtype)
         if rank == (0 if side == 'source' else 1):
             assert 'conjugate or negative view' in str(refused.value.__cause__)
-        assert not store.any()
+        assert not store.cpu().any()
 
 
 class TestB2TwoLayoutsOnOneProcess(DistributedTest):
